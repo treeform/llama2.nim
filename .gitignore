@@ -1,0 +1,12 @@
+# ignore files with no extention:
+*
+!*/
+!*.*
+
+# normal ignores:
+*.exe
+nimcache
+*.pdb
+*.ilk
+*.out
+.*
