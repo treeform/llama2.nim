@@ -1,32 +1,32 @@
 import cligen, std/tables, std/times, math, std/algorithm, std/strutils,
-    std/streams, std/os
+    std/streams, std/os, std/memfiles
 
 type
   Config = object
     dim: cint           # transformer dimension
-    hidden_dim: cint    # for ffn layers
-    n_layers: cint      # number of layers
-    n_heads: cint       # number of query heads
-    n_kv_heads: cint    # number of key/value heads (can be < query heads because of multiquery)
-    vocab_size: cint    # vocabulary size, usually 256 (byte-level)
+    hiddenDim: cint    # for ffn layers
+    numLayers: cint      # number of layers
+    numHeads: cint       # number of query heads
+    numKVHeads: cint    # number of key/value heads (can be < query heads because of multiquery)
+    vocabSize: cint    # vocabulary size, usually 256 (byte-level)
     seq_len: cint       # max sequence length
 
   TransformerWeights = object
     # token embedding table
-    token_embedding_table: ptr[float32]    # (vocab_size, dim)
-    # weights for rmsnorms
-    rms_att_weight: ptr[float32] # (layer, dim) rmsnorm weights
+    token_embedding_table: ptr[float32]    # (vocabSize, dim)
+    # weights for rmsNorms
+    rms_att_weight: ptr[float32] # (layer, dim) rmsNorm weights
     rms_ffn_weight: ptr[float32] # (layer, dim)
-    # weights for matmuls. note dim == n_heads * head_size
-    wq: ptr[float32] # (layer, dim, n_heads * head_size)
-    wk: ptr[float32] # (layer, dim, n_kv_heads * head_size)
-    wv: ptr[float32] # (layer, dim, n_kv_heads * head_size)
-    wo: ptr[float32] # (layer, n_heads * head_size, dim)
+    # weights for matMuls. note dim == numHeads * head_size
+    wq: ptr[float32] # (layer, dim, numHeads * head_size)
+    wk: ptr[float32] # (layer, dim, numKVHeads * head_size)
+    wv: ptr[float32] # (layer, dim, numKVHeads * head_size)
+    wo: ptr[float32] # (layer, numHeads * head_size, dim)
     # weights for ffn
-    w1: ptr[float32] # (layer, hidden_dim, dim)
-    w2: ptr[float32] # (layer, dim, hidden_dim)
-    w3: ptr[float32] # (layer, hidden_dim, dim)
-    # final rmsnorm
+    w1: ptr[float32] # (layer, hiddenDim, dim)
+    w2: ptr[float32] # (layer, dim, hiddenDim)
+    w3: ptr[float32] # (layer, hiddenDim, dim)
+    # final rmsNorm
     rms_final_weight: ptr[float32] # (dim,)
     # (optional) classifier weights for the logits, on the last layer
     wcls: ptr[float32]
@@ -36,36 +36,34 @@ type
     x: ptr[float32]   # activation at current time stamp (dim,)
     xb: ptr[float32]  # same, but inside a residual branch (dim,)
     xb2: ptr[float32] # an additional buffer just for convenience (dim,)
-    hb: ptr[float32]  # buffer for hidden dimension in the ffn (hidden_dim,)
-    hb2: ptr[float32] # buffer for hidden dimension in the ffn (hidden_dim,)
+    hb: ptr[float32]  # buffer for hidden dimension in the ffn (hiddenDim,)
+    hb2: ptr[float32] # buffer for hidden dimension in the ffn (hiddenDim,)
     q: ptr[float32]   # query (dim,)
     k: ptr[float32]   # key (dim,)
     v: ptr[float32]   # value (dim,)
-    att: ptr[float32] # buffer for scores/attention values (n_heads, seq_len)
+    att: ptr[float32] # buffer for scores/attention values (numHeads, seq_len)
     logits: ptr[float32] # output logits
     # kv cache
     key_cache: ptr[float32]   # (layer, seq_len, dim)
     value_cache: ptr[float32] # (layer, seq_len, dim)
 
-  Transformer = object
+  Transformer = ref object
     config: Config              # the hyperparameters of the architecture (the blueprint)
     weights: TransformerWeights # the weights of the model
     state: RunState             # buffers for the "wave" of activations in the forward pass
     # some more state needed to properly clean up the memory mapping (sigh)
-    fd: int                     # file descriptor for memory mapping
-    data: ptr[float32]          # memory mapped data pointer
-    file_size: int              # size of the checkpoint file in bytes
+    fileSize: int              # size of the checkpoint file in bytes
 
 type
   TokenIndex = object
     str: cstring  # Equivalent of char* in Nim
     id: cint
 
-  Tokenizer = object
+  Tokenizer = ref object
     vocab: ptr[ptr[char]] # Equivalent of char** in Nim
     vocab_scores: ptr[float32]
     sorted_vocab: ptr[TokenIndex]
-    vocab_size: cint
+    vocabSize: cint
     max_token_length: uint32      # Equivalent of unsigned int in Nim
     byte_pieces: array[512, uint8] # Equivalent of unsigned char[512] in Nim
 
@@ -74,89 +72,12 @@ type
     prob: float32  # float in C
     index: cint    # int in C
 
-  Sampler = object
-    vocab_size: cint
-    probindex: ptr[ProbIndex] # equivalent of ProbIndex* in C
+  Sampler = ref object
+    vocabSize: cint
+    probIndex: ptr[ProbIndex] # equivalent of ProbIndex* in C
     temperature: float32
     topp: float32
-    rng_state: uint64   # equivalent of unsigned long long in C
-
-
-proc newTransformer(t: var Transformer, checkpointPath: string) =
-  var f = newFileStream(checkpointPath)
-  var c: Config
-  f.read(c)
-  t.config = c
-
-  if t.config.vocab_size < 0:
-    quit("Negative t.config.vocab_size?")
-  # let
-  #   shared_weights =
-  #     if t.config.vocab_size > 0:
-  #       true
-  #     else:
-  #       false
-  # # let
-  # #   t.config.vocab_size = abs(t.config.vocab_size)
-  let
-    shared_weights = true
-
-  t.file_size = getFileSize(checkpointPath).int
-
-  proc read_floats(count: int): ptr[float32] =
-    let buffer = alloc0(count * 4)
-    var bytes = f.readData(buffer, count * 4)
-    if bytes != count * 4:
-      quit("read error")
-    return cast[ptr[float32]](buffer)
-
-  t.weights.token_embedding_table = read_floats(c.vocab_size * c.dim)
-  t.weights.rms_att_weight = read_floats(c.n_layers * c.dim)
-  t.weights.wq = read_floats(c.n_layers * c.dim * c.dim)
-  t.weights.wk = read_floats(c.n_layers * c.dim * c.dim)
-  t.weights.wv = read_floats(c.n_layers * c.dim * c.dim)
-  t.weights.wo = read_floats(c.n_layers * c.dim * c.dim)
-  t.weights.rms_ffn_weight = read_floats(c.n_layers * c.dim)
-  t.weights.w1 = read_floats(c.n_layers * c.dim * c.hidden_dim)
-  t.weights.w2 = read_floats(c.n_layers * c.hidden_dim * c.dim)
-  t.weights.w3 = read_floats(c.n_layers * c.dim * c.hidden_dim)
-  t.weights.rms_final_weight = read_floats(c.dim)
-  #t.weights.freq_cis_real
-  discard read_floats(c.seq_len * (c.dim div c.n_heads) div 2)
-  #t.weights.freq_cis_imag =
-  discard read_floats(c.seq_len * (c.dim div c.n_heads) div 2)
-  if shared_weights:
-    t.weights.wcls = t.weights.token_embedding_table
-  else:
-    if (t.file_size - f.getPosition()) div 4 <= 0:
-      quit("wcls size is invalid!")
-    t.weights.wcls = read_floats((t.file_size - f.getPosition()) div 4)
-
-  # Allocate run state
-  let kv_dim = (c.dim * c.n_kv_heads) div c.n_heads
-  t.state.x = cast[ptr float32](alloc0(c.dim * sizeof(float32)))
-  t.state.xb = cast[ptr float32](alloc0(c.dim * sizeof(float32)))
-  t.state.xb2 = cast[ptr float32](alloc0(c.dim * sizeof(float32)))
-  t.state.hb = cast[ptr float32](alloc0(c.hidden_dim * sizeof(float32)))
-  t.state.hb2 = cast[ptr float32](alloc0(c.hidden_dim * sizeof(float32)))
-  t.state.q = cast[ptr float32](alloc0(c.dim * sizeof(float32)))
-  t.state.k = cast[ptr float32](alloc0(kv_dim * sizeof(float32)))
-  t.state.v = cast[ptr float32](alloc0(kv_dim * sizeof(float32)))
-  t.state.att = cast[ptr float32](alloc0(c.n_heads * c.seq_len * sizeof(float32)))
-  t.state.logits = cast[ptr float32](alloc0(c.vocab_size * sizeof(float32)))
-  t.state.key_cache = cast[ptr float32](alloc0(c.n_layers * c.seq_len * kv_dim * sizeof(float32)))
-  t.state.value_cache = cast[ptr float32](alloc0(c.n_layers * c.seq_len * kv_dim * sizeof(float32)))
-
-
-
-# proc build_transformer(t: ptr[Transformer], checkpoint_path: cstring) {.importc.}
-#proc build_tokenizer(t: ptr[Tokenizer], tokenizer_path: cstring, vocab_size: int) {.importc.}
-# proc build_sampler(sampler: ptr[Sampler], vocab_size: cint, temperature: float32, topp: float32, rng_seed: uint64) {.importc.}
-# proc generate(transformer: ptr Transformer, tokenizer: ptr Tokenizer, sampler: ptr Sampler, prompt: cstring, steps: cint) {.importc.}
-
-#proc chat(transformer: ptr Transformer, tokenizer: ptr Tokenizer, sampler: ptr Sampler, cli_user_prompt: cstring, cli_system_prompt: cstring, steps: cint) {.importc.}
-#proc encode(t: ptr Tokenizer, text: cstring, bos: int8, eos: int8, tokens: ptr cint, n_tokens: ptr cint) {.importc.}
-#proc decode(t: ptr Tokenizer, prev_token: cint, token: cint): cstring {.importc.}
+    rngState: uint64   # equivalent of unsigned long long in C
 
 proc `+`[T](p: ptr[T], n: SomeInteger): ptr[T] =
   cast[ptr[T]](cast[uint64](p) + n.uint64 * sizeof(T).uint64)
@@ -169,32 +90,101 @@ proc `[]=`[T](p: ptr[T], n: SomeInteger, v: T) =
   let p2 = p + n
   p2[] = v
 
+proc `+`(p: pointer, n: SomeInteger): pointer =
+  cast[pointer](cast[uint64](p) + n.uint64)
 
-proc newTokenizer(t: var Tokenizer, tokenizer_path: string, vocab_size: cint) =
+proc newTransformer(checkpointPath: string): Transformer =
+  let t = Transformer()
+  var f = memfiles.open(checkpointPath)
+
+  var filePosition = f.mem
+
+  proc readObj[T](obj: var T) =
+    copyMem(obj.addr, filePosition, sizeof(obj))
+    filePosition = filePosition + sizeof(obj)
+
+  proc readFloats(count: int): ptr[float32] =
+    result = cast[ptr[float32]](filePosition)
+    filePosition = filePosition + (count * 4)
+
+  var c: Config
+  readObj(c)
+
+  let shared_weights =
+    if c.vocabSize > 0:
+      true
+    else:
+      false
+  c.vocabSize = abs(c.vocabSize)
+  t.config = c
+
+  t.fileSize = f.size
+
+  t.weights.token_embedding_table = readFloats(c.vocabSize * c.dim)
+  t.weights.rms_att_weight = readFloats(c.numLayers * c.dim)
+  t.weights.wq = readFloats(c.numLayers * c.dim * c.dim)
+  t.weights.wk = readFloats(c.numLayers * c.dim * c.dim)
+  t.weights.wv = readFloats(c.numLayers * c.dim * c.dim)
+  t.weights.wo = readFloats(c.numLayers * c.dim * c.dim)
+  t.weights.rms_ffn_weight = readFloats(c.numLayers * c.dim)
+  t.weights.w1 = readFloats(c.numLayers * c.dim * c.hiddenDim)
+  t.weights.w2 = readFloats(c.numLayers * c.hiddenDim * c.dim)
+  t.weights.w3 = readFloats(c.numLayers * c.dim * c.hiddenDim)
+  t.weights.rms_final_weight = readFloats(c.dim)
+  # Skipping unused t.weights.freq_cis_real
+  discard readFloats(c.seq_len * (c.dim div c.numHeads) div 2)
+  # Skipping unused t.weights.freq_cis_imag =
+  discard readFloats(c.seq_len * (c.dim div c.numHeads) div 2)
+  if shared_weights:
+    t.weights.wcls = t.weights.token_embedding_table
+  else:
+    # The rest of the file
+    t.weights.wcls = cast[ptr float32](filePosition)
+
+  # Allocate run state
+  let kvDim = (c.dim * c.numKVHeads) div c.numHeads
+  t.state.x = cast[ptr float32](alloc0(c.dim * sizeof(float32)))
+  t.state.xb = cast[ptr float32](alloc0(c.dim * sizeof(float32)))
+  t.state.xb2 = cast[ptr float32](alloc0(c.dim * sizeof(float32)))
+  t.state.hb = cast[ptr float32](alloc0(c.hiddenDim * sizeof(float32)))
+  t.state.hb2 = cast[ptr float32](alloc0(c.hiddenDim * sizeof(float32)))
+  t.state.q = cast[ptr float32](alloc0(c.dim * sizeof(float32)))
+  t.state.k = cast[ptr float32](alloc0(kvDim * sizeof(float32)))
+  t.state.v = cast[ptr float32](alloc0(kvDim * sizeof(float32)))
+  t.state.att = cast[ptr float32](alloc0(c.numHeads * c.seq_len * sizeof(float32)))
+  t.state.logits = cast[ptr float32](alloc0(c.vocabSize * sizeof(float32)))
+  t.state.key_cache = cast[ptr float32](alloc0(c.numLayers * c.seq_len * kvDim * sizeof(float32)))
+  t.state.value_cache = cast[ptr float32](alloc0(c.numLayers * c.seq_len * kvDim * sizeof(float32)))
+
+  return t
+
+proc newTokenizer(tokenizer_path: string, vocabSize: cint): Tokenizer =
+  let t = Tokenizer()
   let f = newFileStream(tokenizer_path)
-  t.vocab_size = vocab_size
+  t.vocabSize = vocabSize
 
-  t.vocab = cast[ptr ptr char](alloc0(vocab_size * sizeof(ptr char)))
-  t.vocab_scores = cast[ptr float32](alloc0(vocab_size * sizeof(float32)))
+  t.vocab = cast[ptr ptr char](alloc0(vocabSize * sizeof(ptr char)))
+  t.vocab_scores = cast[ptr float32](alloc0(vocabSize * sizeof(float32)))
 
   for i in 0..255:
     t.byte_pieces[i * 2] = i.uint8
     t.byte_pieces[i * 2 + 1] = 0.uint8
 
   t.max_token_length = f.readUInt32()
-  #echo "max_token_length ", max_token_length
-  for i in 0 ..< vocab_size:
-    #echo i
+  for i in 0 ..< vocabSize:
     t.vocab_scores[i] = f.readFloat32()
     let len = f.readInt32()
-    #echo "len ", len
     let bstr = f.readStr(len)
-    #echo bstr
     t.vocab[i] = cast[ptr char](alloc0(len+1))
     for j in 0 ..< len:
       t.vocab[i][j] = bstr[j]
 
-proc decode(t: ptr Tokenizer, prev_token: cint, token: cint): string =
+  f.close()
+
+  return t
+
+proc decode(t: Tokenizer, prev_token: cint, token: cint): string =
+  ## Takes a tokenID and turns it into a string part.
   var piece = t.vocab[token]
   for i in 0 .. 32:
     if piece[i] == '\0':
@@ -207,23 +197,26 @@ proc decode(t: ptr Tokenizer, prev_token: cint, token: cint): string =
   if result == "<0x0A>":
     result = "\n"
 
-proc getToken(t: ptr Tokenizer, tokenNum: cint): string =
+proc getToken(t: Tokenizer, tokenId: cint): string =
+  ## Given a tokenId returns its string part.
   var token = ""
-  var piece = t.vocab[tokenNum]
+  var piece = t.vocab[tokenId]
   for i in 0 .. 32:
     if piece[i] == '\0':
       break
     token.add piece[i]
   return token
 
-proc str_lookup(t: ptr Tokenizer, s: string): cint =
-  for tokenId in 0 ..< t.vocab_size:
+proc findToken(t: Tokenizer, stringPart: string): cint =
+  ## Given a token string part, returns its tokenId.
+  for tokenId in 0 ..< t.vocabSize:
     var token = t.getToken(tokenId)
-    if token == s:
+    if token == stringPart:
       return tokenId.cint
   return -1
 
-proc encode(t: ptr Tokenizer, text: string): seq[cint] =
+proc encode(t: Tokenizer, text: string): seq[cint] =
+  ## Takes a string and encodes it into seq of token Ids.
 
   var tokens: seq[cint]
   tokens.add 1
@@ -235,45 +228,37 @@ proc encode(t: ptr Tokenizer, text: string): seq[cint] =
 
   # First encode every individual character in the input text
   for c in text:
-    let id = t.str_lookup($c)
-    if id == -1:
+    let tokenId = t.findToken($c)
+    if tokenId == -1:
       quit("Error encoding")
-    tokens.add(id.cint)
+    tokens.add(tokenId.cint)
 
   # Merge the best consecutive pair each iteration, according to the scores in vocab_scores
   while true:
     var
-      best_score = float32.low
-      best_id = -1.cint
-      best_idx = -1.cint
+      bestScore = float32.low
+      bestId = -1.cint
+      bestIdx = -1.cint
 
     for i in 0 ..< tokens.len - 1:
       # Check if we can merge the pair (tokens[i], tokens[i+1])
       var str = t.getToken(tokens[i]) & t.getToken(tokens[i + 1])
-      let id = t.str_lookup(str)
-      #echo "id ", id
-      if id != -1 and t.vocab_scores[id] > best_score:
+      let tokenId = t.findToken(str)
+      if tokenId != -1 and t.vocab_scores[tokenId] > bestScore:
         # This merge pair exists in vocab! Record its score and position
-        best_score = t.vocab_scores[id]
-        best_id = id
-        best_idx = i.cint
+        bestScore = t.vocab_scores[tokenId]
+        bestId = tokenId
+        bestIdx = i.cint
 
-    if best_idx == -1:
+    if bestIdx == -1:
       break  # We couldn't find any more pairs to merge, so we're done
 
-    # Merge the consecutive pair (best_idx, best_idx+1) into new token best_id
-    tokens[best_idx] = best_id
-    # Delete token at position best_idx+1, shift the entire sequence back 1
-    tokens.delete(best_idx + 1)
-    #echo "merge", tokens[best_idx]
+    # Merge the consecutive pair (bestIdx, bestIdx+1) into new token bestId
+    tokens[bestIdx] = bestId
+    # Delete token at position bestIdx+1, shift the entire sequence back 1
+    tokens.delete(bestIdx + 1)
 
   return tokens
-
-#proc forward(transformer: ptr Transformer, token: cint, pos: cint): ptr float32 {.importc.}
-#proc sample(sampler: ptr Sampler, logits: ptr float32): cint {.importc.}
-#proc rmsnorm(o: ptr float32, x: ptr float32, weight: ptr float32, size: cint) {.importc.}
-#proc softmax(x: ptr float32, size: cint) {.importc.}
-#proc matmul(xout: ptr float32, x: ptr float32, w: ptr float32, n: cint, d: cint) {.importc.}
 
 template powf(a, b: float32): float32 = pow(a, b)
 template cosf(a: float32): float32 = cos(a)
@@ -281,7 +266,7 @@ template sinf(a: float32): float32 = sin(a)
 template sqrtf(a: float32): float32 = sqrt(a)
 template expf(a: float32): float32 = exp(a)
 
-proc rmsnorm(o: ptr float32, x: ptr float32, weight: ptr float32, size: cint) =
+proc rmsNorm(o: ptr float32, x: ptr float32, weight: ptr float32, size: cint) =
   # Calculate sum of squares
   var ss = 0.0'f32
   for j in 0 ..< size:
@@ -293,7 +278,7 @@ proc rmsnorm(o: ptr float32, x: ptr float32, weight: ptr float32, size: cint) =
   for j in 0 ..< size:
     o[j] = weight[j] * (ss * x[j])
 
-proc softmax(x: ptr float32, size: cint) =
+proc softMax(x: ptr float32, size: cint) =
   # Find max value (for numerical stability)
   var maxVal = x[0]
   for i in 1 ..< size:
@@ -310,7 +295,7 @@ proc softmax(x: ptr float32, size: cint) =
   for i in 0 ..< size:
     x[i] = x[i] / sum
 
-proc matmul(xout: ptr float32, x: ptr float32, w: ptr float32, n: cint, d: cint) =
+proc matMul(xout: ptr float32, x: ptr float32, w: ptr float32, n: cint, d: cint) =
   # W (d,n) @ x (n,) -> xout (d,)
   # by far the most amount of time is spent inside this little function
 
@@ -322,32 +307,32 @@ proc matmul(xout: ptr float32, x: ptr float32, w: ptr float32, n: cint, d: cint)
       val += w[i * n + j] * x[j]
     xout[i] = val
 
-proc forward(transformer: ptr Transformer, token: cint, pos: cint): ptr float32 =
+proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
   # Convenience variables
   let p = addr transformer.config
   let w = addr transformer.weights
   let s = addr transformer.state
   let x = s.x
   let dim = p.dim
-  let kv_dim = (p.dim * p.n_kv_heads) div p.n_heads
-  let kv_mul = p.n_heads div p.n_kv_heads  # Integer multiplier of the kv sharing in multiquery
-  let hidden_dim = p.hidden_dim
-  let head_size = dim div p.n_heads
+  let kvDim = (p.dim * p.numKVHeads) div p.numHeads
+  let kvMul = p.numHeads div p.numKVHeads  # Integer multiplier of the kv sharing in multiquery
+  let hiddenDim = p.hiddenDim
+  let head_size = dim div p.numHeads
 
-  # copy the token embedding into x
+  # Copy the token embedding into x
   let contentRow = w.token_embedding_table + token * dim
   copyMem(x, contentRow, dim * sizeof(x[]))
 
   # Forward all the layers
-  for l in 0 ..< p.n_layers:
+  for l in 0 ..< p.numLayers:
 
-    # Attention rmsnorm
-    rmsnorm(s.xb, x, w.rms_att_weight + l*dim, dim)
+    # Attention rmsNorm
+    rmsNorm(s.xb, x, w.rms_att_weight + l*dim, dim)
 
-    # QKV matmuls for this position
-    matmul(s.q, s.xb, w.wq + l*dim*dim, dim, dim)
-    matmul(s.k, s.xb, w.wk + l*dim*kv_dim, dim, kv_dim)
-    matmul(s.v, s.xb, w.wv + l*dim*kv_dim, dim, kv_dim)
+    # QKV matMuls for this position
+    matMul(s.q, s.xb, w.wq + l*dim*dim, dim, dim)
+    matMul(s.k, s.xb, w.wk + l*dim*kvDim, dim, kvDim)
+    matMul(s.v, s.xb, w.wv + l*dim*kvDim, dim, kvDim)
 
     # RoPE relative positional encoding: complex-valued rotate q and k in each head
     for i in countup(0, dim - 1, 2):
@@ -375,7 +360,7 @@ proc forward(transformer: ptr Transformer, token: cint, pos: cint): ptr float32 
     # Multihead attention. Iterate over all heads
     # var h: cint
     # pragma omp parallel for private(h)
-    for h in 0..<p.nHeads:
+    for h in 0 ..< p.numHeads:
       # Get the query vector for this head
       let q = s.q + h * headSize
       # Attention scores for this head
@@ -386,14 +371,14 @@ proc forward(transformer: ptr Transformer, token: cint, pos: cint): ptr float32 
         let k = s.keyCache + loff + t * kvDim + (h div kvMul) * headSize
         # Calculate the attention score as the dot product of q and k
         var score: float32 = 0.0
-        for i in 0..<headSize:
+        for i in 0 ..< headSize:
             score += q[i] * k[i]
         score /= sqrt(float32(headSize))
         # Save the score to the attention buffer
         att[t] = score
 
-      # Softmax the scores to get attention weights, from 0..pos inclusively
-      softmax(att, pos + 1)
+      # SoftMax the scores to get attention weights, from 0..pos inclusively
+      softMax(att, pos + 1)
 
       # Weighted sum of the values, store back into xb
       let xb = s.xb + h * headSize
@@ -407,23 +392,23 @@ proc forward(transformer: ptr Transformer, token: cint, pos: cint): ptr float32 
         for i in 0..<headSize:
           xb[i] = xb[i] + a * v[i]
 
-    # Final matmul to get the output of the attention
-    matmul(s.xb2, s.xb, w.wo + l * dim * dim, dim, dim)
+    # Final matMul to get the output of the attention
+    matMul(s.xb2, s.xb, w.wo + l * dim * dim, dim, dim)
 
     # Residual connection back into x
     for i in 0..<dim:
       x[i] = x[i] + s.xb2[i]
 
-    # FFN rmsnorm
-    rmsnorm(s.xb, x, w.rms_ffn_weight + l * dim, dim)
+    # FFN rmsNorm
+    rmsNorm(s.xb, x, w.rms_ffn_weight + l * dim, dim)
 
     # Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     # First calculate self.w1(x) and self.w3(x)
-    matmul(s.hb, s.xb, w.w1 + l * dim * hidden_dim, dim, hidden_dim)
-    matmul(s.hb2, s.xb, w.w3 + l * dim * hidden_dim, dim, hidden_dim)
+    matMul(s.hb, s.xb, w.w1 + l * dim * hiddenDim, dim, hiddenDim)
+    matMul(s.hb2, s.xb, w.w3 + l * dim * hiddenDim, dim, hiddenDim)
 
     # SwiGLU non-linearity
-    for i in 0..<hidden_dim:
+    for i in 0..<hiddenDim:
         var val = s.hb[i]
         # silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
         val *= (1.0 / (1.0 + exp(-val)))
@@ -431,53 +416,55 @@ proc forward(transformer: ptr Transformer, token: cint, pos: cint): ptr float32 
         val *= s.hb2[i]
         s.hb[i] = val
 
-    # Final matmul to get the output of the ffn
-    matmul(s.xb, s.hb, w.w2 + l * dim * hidden_dim, hidden_dim, dim)
+    # Final matMul to get the output of the ffn
+    matMul(s.xb, s.hb, w.w2 + l * dim * hiddenDim, hiddenDim, dim)
 
     # Residual connection
     for i in 0..<dim:
       x[i] = x[i] + s.xb[i]
 
-  # Final rmsnorm
-  rmsnorm(x, x, w.rms_final_weight, dim)
+  # Final rmsNorm
+  rmsNorm(x, x, w.rms_final_weight, dim)
 
   # Classifier into logits
-  matmul(s.logits, x, w.wcls, p.dim, p.vocab_size)
+  matMul(s.logits, x, w.wcls, p.dim, p.vocabSize)
 
   return s.logits
 
-proc newSampler(sampler: var Sampler, vocab_size: cint, temperature: float32, topp: float32, rng_seed: uint64) =
-  sampler.vocab_size = vocab_size
+proc newSampler(vocabSize: cint, temperature: float32, topp: float32, rngSeed: uint64): Sampler =
+  let sampler = Sampler()
+  sampler.vocabSize = vocabSize
   sampler.temperature = temperature
   sampler.topp = topp
-  sampler.rng_state = rng_seed
+  sampler.rngState = rngSeed
   # buffer only used with nucleus sampling; may not need but it's ~small
-  sampler.probindex = cast[ptr[ProbIndex]](alloc0(sampler.vocab_size * sizeof(ProbIndex)))
+  sampler.probIndex = cast[ptr[ProbIndex]](alloc0(sampler.vocabSize * sizeof(ProbIndex)))
+  return sampler
 
-proc sample_argmax(probabilities: ptr float32, n: cint): cint =
+proc sampleArgmax(probabilities: ptr float32, n: cint): cint =
   # return the index that has the highest probability
   var
-    max_i: cint = 0
-    max_p: float32 = probabilities[0]
+    maxI: cint = 0
+    maxP: float32 = probabilities[0]
 
-  for i in 1..<n:
-    if probabilities[i] > max_p:
-      max_i = i
-      max_p = probabilities[i]
+  for i in 1 ..< n:
+    if probabilities[i] > maxP:
+      maxI = i
+      maxP = probabilities[i]
 
-  return max_i
+  return maxI
 
-proc sample_mult(probabilities: ptr float32, n: cint, coin: float32): cint =
+proc sampleMult(probabilities: ptr float32, n: cint, coin: float32): cint =
   # Sample index from probabilities (they must sum to 1!)
-  # Coin is a random number in [0, 1), usually from random_f32()
+  # Coin is a random number in [0, 1), usually from randomFloat32()
   var cdf = 0.0'f32
-  for i in 0..<n:
+  for i in 0 ..< n:
     cdf += probabilities[i]
     if coin < cdf:
       return i
   return n - 1  # In case of rounding errors
 
-proc random_u32(statePtr: ptr uint64): uint32 =
+proc randomUInt32(statePtr: ptr uint64): uint32 =
   # xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
   var state = statePtr[]
   state = state xor (state shr 12)
@@ -486,8 +473,8 @@ proc random_u32(statePtr: ptr uint64): uint32 =
   result = ((state * 0x2545F4914F6CDD1D'u64) shr 32).uint32
   statePtr[] = state
 
-proc random_f32(state: ptr uint64): float32 =  # random float32 in [0,1)
-  result = (random_u32(state) shr 8).float32 / 16777216.0'f32
+proc randomFloat32(state: ptr uint64): float32 =  # random float32 in [0,1)
+  result = (randomUInt32(state) shr 8).float32 / 16777216.0'f32
 
 proc compare(a, b: ProbIndex): int =
   if a.prob > b.prob:
@@ -496,11 +483,11 @@ proc compare(a, b: ProbIndex): int =
     return 1
   return 0
 
-proc sample_topp(probabilities: ptr float32, n: cint, topp: float32, probindex: ptr ProbIndex, coin: float32): cint =
+proc sampleTopp(probabilities: ptr float32, n: cint, topp: float32, probIndex: ptr ProbIndex, coin: float32): cint =
   # top-p sampling (or "nucleus sampling") samples from the smallest set of
   # tokens that exceed probability topp. This way we never sample tokens that
   # have very low probabilities and are less likely to go "off the rails".
-  # coin is a random number in [0, 1), usually from random_f32()
+  # coin is a random number in [0, 1), usually from randomFloat32()
 
   var n0: cint = 0
   # quicksort indices in descending order of probabilities
@@ -512,22 +499,20 @@ proc sample_topp(probabilities: ptr float32, n: cint, topp: float32, probindex: 
       var prob = ProbIndex()
       prob.index = i.cint
       prob.prob = probabilities[i]
-      probindex[n0] = prob
-      # probindex[n0].index = i
-      # probindex[n0].prob = probabilities[i]
+      probIndex[n0] = prob
       inc(n0)
 
-  #qsort(probindex, n0.csizet, sizeof(ProbIndex).csizet, compare)
+  # TODO: remove this Copy
   var probindexSeq = newSeq[ProbIndex](n0.int)
-  for i in 0 ..< n0: probindexSeq[i] = probindex[i]
+  for i in 0 ..< n0: probindexSeq[i] = probIndex[i]
   sort(probindexSeq, compare)
-  for i in 0 ..< n0: probindex[i] = probindexSeq[i]
+  for i in 0 ..< n0: probIndex[i] = probindexSeq[i]
 
   # truncate the list where cumulative probability exceeds topp
   var cumulative_prob = 0.0'f32
   var last_idx = n0 - 1  # in case of rounding errors consider all elements
   for i in 0..<n0:
-    cumulative_prob += probindex[i].prob
+    cumulative_prob += probIndex[i].prob
     if cumulative_prob > topp:
       last_idx = i
       break  # we've exceeded topp by including last_idx
@@ -536,64 +521,49 @@ proc sample_topp(probabilities: ptr float32, n: cint, topp: float32, probindex: 
   let r = coin * cumulative_prob
   var cdf = 0.0'f32
   for i in 0 ..< last_idx + 1:
-    cdf += probindex[i].prob
+    cdf += probIndex[i].prob
     if r < cdf:
-      return probindex[i].index
+      return probIndex[i].index
 
-  return probindex[last_idx].index  # in case of rounding errors
+  return probIndex[last_idx].index  # in case of rounding errors
 
-proc sample(sampler: ptr Sampler, logits: ptr float32): cint =
+proc sample(sampler: Sampler, logits: ptr float32): cint =
   # sample the token given the logits and some hyperparameters
   var next: cint
-  if sampler[].temperature == 0.0'f32:
+  if sampler.temperature == 0.0'f32:
     # greedy argmax sampling: take the token with the highest probability
-    next = sample_argmax(logits, sampler[].vocab_size)
+    next = sampleArgmax(logits, sampler.vocabSize)
   else:
     # apply the temperature to the logits
-    for q in 0..<sampler[].vocab_size:
-      logits[q] = logits[q] / sampler[].temperature
-    # apply softmax to the logits to get the probabilities for next token
-    softmax(logits, sampler[].vocab_size)
+    for q in 0..< sampler.vocabSize:
+      logits[q] = logits[q] / sampler.temperature
+    # apply softMax to the logits to get the probabilities for next token
+    softMax(logits, sampler.vocabSize)
     # flip a (float) coin (this is our source of entropy for sampling)
-    let coin = random_f32(addr sampler[].rng_state)
+    let coin = randomFloat32(unsafeAddr sampler.rngState)
     # we sample from this distribution to get the next token
-    if sampler[].topp <= 0 or sampler[].topp >= 1:
+    if sampler.topp <= 0 or sampler.topp >= 1:
       # simply sample from the predicted probability distribution
-      next = sample_mult(logits, sampler[].vocab_size, coin)
+      next = sampleMult(logits, sampler.vocabSize, coin)
     else:
       # top-p (nucleus) sampling, clamping the least likely tokens to zero
-      next = sample_topp(
+      next = sampleTopp(
         logits,
-        sampler[].vocab_size,
-        sampler[].topp,
-        sampler[].probindex, coin
+        sampler.vocabSize,
+        sampler.topp,
+        sampler.probIndex, coin
       )
   return next
 
-proc generate(transformer: ptr Transformer, tokenizer: ptr Tokenizer, sampler: ptr Sampler, prompt: string, steps: cint): string =
+proc generate(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, prompt: string, steps: cint): string =
 
-  # var numPromptTokens: cint = 0 # Using Nim naming conventions
-  # var promptTokens0 = newSeq[cint](prompt.len + 3)
-
-  # encode(tokenizer, prompt.cstring, 1, 0, promptTokens0[0].addr, addr numPromptTokens) # Assuming encode has been defined or imported to Nim
-  # if numPromptTokens < 1:
-  #   quit("something is wrong, expected at least 1 prompt token")
-
-  # echo "---"
-  # for i in 0 ..< numPromptTokens:
-  #   echo ": ", promptTokens0[i]
-
-
-  #echo "---"
   let promptTokens = encode(tokenizer, prompt)
-  for token in promptTokens:
-    echo ": ", token
 
   var
     startTime: float
     next: cint
     token = promptTokens[0] # kick off with the first token in the prompt
-    pos: cint = 0     # position in the sequence
+    pos: cint = 0 # position in the sequence
 
   while pos < steps:
     # ... rest of the loop
@@ -621,8 +591,6 @@ proc generate(transformer: ptr Transformer, tokenizer: ptr Tokenizer, sampler: p
     stdout.flushFile()
     result.add(piece)
     token = next
-
-    # quit("\nok...")
 
     if startTime == 0:
       startTime = epochTime()
@@ -678,12 +646,12 @@ proc main*(
     topp = pvalue
     steps = steps
     prompt = input
-    rng_seed = seed
+    rngSeed = seed
     mode = mode
     system_prompt = sysPrompt
 
-  if rng_seed <= 0:
-    rng_seed = int(getTime().toUnix)
+  if rngSeed <= 0:
+    rngSeed = int(getTime().toUnix)
   if temperature < 0.0:
     temperature = 0.0
   if topp < 0.0 or 1.0 < topp:
@@ -692,25 +660,21 @@ proc main*(
     steps = 0
 
   echo "build the Transformer via the model .bin file"
-  var transformer: Transformer
-  newTransformer(transformer, checkpoint_path)
+  var transformer = newTransformer(checkpoint_path)
 
   echo "build the Tokenizer via the tokenizer .bin file"
-  var tokenizer: Tokenizer
-  #build_tokenizer(tokenizer.addr, tokenizer_path.cstring, transformer.config.vocab_size)
-  newTokenizer(tokenizer, tokenizer_path, transformer.config.vocab_size)
+  var tokenizer = newTokenizer(tokenizer_path, transformer.config.vocabSize)
 
   echo "build the Sampler"
-  var sampler: Sampler
-  newSampler(sampler, transformer.config.vocab_size, temperature, topp, rng_seed.uint64)
+  var sampler = newSampler(transformer.config.vocabSize, temperature, topp, rngSeed.uint64)
 
   echo "done loading"
 
   if mode == "generate":
-    echo generate(
-      transformer.addr,
-      tokenizer.addr,
-      sampler.addr,
+    discard generate(
+      transformer,
+      tokenizer,
+      sampler,
       prompt,
       steps.cint
     )
