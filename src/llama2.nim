@@ -1,6 +1,8 @@
 import cligen, std/tables, std/times, math, std/algorithm, std/strutils,
     std/streams, std/os, std/memfiles
 
+{.passC: "-Ofast -funsafe-math-optimizations -ffast-math -mtune=native -march=native".}
+
 type
   Config = object
     dim: cint           # transformer dimension
@@ -158,9 +160,10 @@ proc newTransformer(checkpointPath: string): Transformer =
 
   return t
 
-proc newTokenizer(tokenizer_path: string, vocabSize: cint): Tokenizer =
+proc newTokenizer(tokenizerPath: string, vocabSize: cint): Tokenizer =
+  ## Creates a new tokenizer given path to a bin.
   let t = Tokenizer()
-  let f = newFileStream(tokenizer_path)
+  let f = newFileStream(tokenizerPath)
   t.vocabSize = vocabSize
 
   t.vocab = cast[ptr ptr char](alloc0(vocabSize * sizeof(ptr char)))
@@ -260,12 +263,6 @@ proc encode(t: Tokenizer, text: string): seq[cint] =
 
   return tokens
 
-template powf(a, b: float32): float32 = pow(a, b)
-template cosf(a: float32): float32 = cos(a)
-template sinf(a: float32): float32 = sin(a)
-template sqrtf(a: float32): float32 = sqrt(a)
-template expf(a: float32): float32 = exp(a)
-
 proc rmsNorm(o: ptr float32, x: ptr float32, weight: ptr float32, size: cint) =
   # Calculate sum of squares
   var ss = 0.0'f32
@@ -273,7 +270,7 @@ proc rmsNorm(o: ptr float32, x: ptr float32, weight: ptr float32, size: cint) =
     ss += x[j] * x[j]
   ss /= size.float32
   ss += 1e-5'f32
-  ss = 1.0'f32 / sqrtf(ss)
+  ss = 1.0'f32 / sqrt(ss)
   # Normalize and scale
   for j in 0 ..< size:
     o[j] = weight[j] * (ss * x[j])
@@ -288,7 +285,7 @@ proc softMax(x: ptr float32, size: cint) =
   # exp and sum
   var sum = 0.0'f32
   for i in 0 ..< size:
-    x[i] = expf(x[i] - maxVal)
+    x[i] = exp(x[i] - maxVal)
     sum += x[i]
 
   # Normalize
@@ -299,8 +296,8 @@ proc matMul(xout: ptr float32, x: ptr float32, w: ptr float32, n: cint, d: cint)
   # W (d,n) @ x (n,) -> xout (d,)
   # by far the most amount of time is spent inside this little function
 
-  # Parallelize outer loop
-  # {.parallel.}
+  #echo "matMul ", $n, "x", $d
+
   for i in 0 ..< d:
     var val = 0.0'f32
     for j in 0 ..< n:
@@ -337,10 +334,10 @@ proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
     # RoPE relative positional encoding: complex-valued rotate q and k in each head
     for i in countup(0, dim - 1, 2):
       let headDim = i mod headSize
-      let freq = 1.0'f32 / powf(10000.0'f32, float32(headDim) / float32(headSize))
+      let freq = 1.0'f32 / pow(10000.0'f32, float32(headDim) / float32(headSize))
       let val = float32(pos) * freq
-      let fcr = cosf(val)
-      let fci = sinf(val)
+      let fcr = cos(val)
+      let fci = sin(val)
       let rotn = if i < kvDim: 2 else: 1  # How many vectors? 2 = q & k, 1 = q only
 
       for v in 0..<rotn:
@@ -357,7 +354,7 @@ proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
     copyMem(keyCacheRow, s.k, kvDim * sizeof(float32))
     copyMem(valueCacheRow, s.v, kvDim * sizeof(float32))
 
-    # Multihead attention. Iterate over all heads
+    # Multi-head attention. Iterate over all heads
     # var h: cint
     # pragma omp parallel for private(h)
     for h in 0 ..< p.numHeads:
@@ -409,12 +406,12 @@ proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
 
     # SwiGLU non-linearity
     for i in 0..<hiddenDim:
-        var val = s.hb[i]
-        # silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-        val *= (1.0 / (1.0 + exp(-val)))
-        # Elementwise multiply with w3(x)
-        val *= s.hb2[i]
-        s.hb[i] = val
+      var val = s.hb[i]
+      # silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+      val *= (1.0 / (1.0 + exp(-val)))
+      # Elementwise multiply with w3(x)
+      val *= s.hb2[i]
+      s.hb[i] = val
 
     # Final matMul to get the output of the ffn
     matMul(s.xb, s.hb, w.w2 + l * dim * hiddenDim, hiddenDim, dim)
@@ -465,6 +462,7 @@ proc sampleMult(probabilities: ptr float32, n: cint, coin: float32): cint =
   return n - 1  # In case of rounding errors
 
 proc randomUInt32(statePtr: ptr uint64): uint32 =
+  ## Compute random uint32
   # xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
   var state = statePtr[]
   state = state xor (state shr 12)
@@ -473,17 +471,19 @@ proc randomUInt32(statePtr: ptr uint64): uint32 =
   result = ((state * 0x2545F4914F6CDD1D'u64) shr 32).uint32
   statePtr[] = state
 
-proc randomFloat32(state: ptr uint64): float32 =  # random float32 in [0,1)
+proc randomFloat32(state: ptr uint64): float32 =
+  ## Compute andom float32 in [0,1)
   result = (randomUInt32(state) shr 8).float32 / 16777216.0'f32
 
 proc compare(a, b: ProbIndex): int =
+  ## Compare two prob indexes for sorting.
   if a.prob > b.prob:
     return -1
   if a.prob < b.prob:
     return 1
   return 0
 
-proc sampleTopp(probabilities: ptr float32, n: cint, topp: float32, probIndex: ptr ProbIndex, coin: float32): cint =
+proc sampleTopP(probabilities: ptr float32, n: cint, topp: float32, probIndex: ptr ProbIndex, coin: float32): cint =
   # top-p sampling (or "nucleus sampling") samples from the smallest set of
   # tokens that exceed probability topp. This way we never sample tokens that
   # have very low probabilities and are less likely to go "off the rails".
@@ -503,10 +503,10 @@ proc sampleTopp(probabilities: ptr float32, n: cint, topp: float32, probIndex: p
       inc(n0)
 
   # TODO: remove this Copy
-  var probindexSeq = newSeq[ProbIndex](n0.int)
-  for i in 0 ..< n0: probindexSeq[i] = probIndex[i]
-  sort(probindexSeq, compare)
-  for i in 0 ..< n0: probIndex[i] = probindexSeq[i]
+  var probIndexSeq = newSeq[ProbIndex](n0.int)
+  for i in 0 ..< n0: probIndexSeq[i] = probIndex[i]
+  sort(probIndexSeq, compare)
+  for i in 0 ..< n0: probIndex[i] = probIndexSeq[i]
 
   # truncate the list where cumulative probability exceeds topp
   var cumulative_prob = 0.0'f32
@@ -528,26 +528,26 @@ proc sampleTopp(probabilities: ptr float32, n: cint, topp: float32, probIndex: p
   return probIndex[last_idx].index  # in case of rounding errors
 
 proc sample(sampler: Sampler, logits: ptr float32): cint =
-  # sample the token given the logits and some hyperparameters
+  # Sample the token given the logits and some hyperparameters
   var next: cint
   if sampler.temperature == 0.0'f32:
-    # greedy argmax sampling: take the token with the highest probability
+    # Greedy argmax sampling: take the token with the highest probability
     next = sampleArgmax(logits, sampler.vocabSize)
   else:
-    # apply the temperature to the logits
-    for q in 0..< sampler.vocabSize:
+    # Apply the temperature to the logits
+    for q in 0 ..< sampler.vocabSize:
       logits[q] = logits[q] / sampler.temperature
-    # apply softMax to the logits to get the probabilities for next token
+    # Apply softMax to the logits to get the probabilities for next token
     softMax(logits, sampler.vocabSize)
-    # flip a (float) coin (this is our source of entropy for sampling)
+    # Flip a (float) coin (this is our source of entropy for sampling)
     let coin = randomFloat32(unsafeAddr sampler.rngState)
-    # we sample from this distribution to get the next token
+    # We sample from this distribution to get the next token
     if sampler.topp <= 0 or sampler.topp >= 1:
-      # simply sample from the predicted probability distribution
+      # Simply sample from the predicted probability distribution
       next = sampleMult(logits, sampler.vocabSize, coin)
     else:
-      # top-p (nucleus) sampling, clamping the least likely tokens to zero
-      next = sampleTopp(
+      # Top-p (nucleus) sampling, clamping the least likely tokens to zero
+      next = sampleTopP(
         logits,
         sampler.vocabSize,
         sampler.topp,
@@ -555,7 +555,8 @@ proc sample(sampler: Sampler, logits: ptr float32): cint =
       )
   return next
 
-proc generate(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, prompt: string, steps: cint): string =
+proc generate(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, prompt: string, steps: cint, interactive = true): string =
+  ## Given a loaded model, generates the output.
 
   let promptTokens = encode(tokenizer, prompt)
 
@@ -587,18 +588,24 @@ proc generate(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, 
     # print the token as string, decode it with the Tokenizer object
     let piece = decode(tokenizer, token, next)
 
-    stdout.write(piece)
-    stdout.flushFile()
+    if piece == "</s>":
+      break
+
+    if interactive:
+      stdout.write(piece)
+      stdout.flushFile()
+
     result.add(piece)
     token = next
 
     if startTime == 0:
       startTime = epochTime()
 
-  echo "\n"
+  if interactive:
+    echo "\n"
   result.add("\n")
 
-  if pos > 1:
+  if pos > 1 and interactive:
     let endTime = epochTime()
     echo "achieved tok/s: ", $(pos.float/(endTime - startTime))
 
@@ -689,7 +696,6 @@ proc main*(
   #   )
   else:
     quit("Use a valid mode")
-
 
 when isMainModule:
   dispatch(main, help = Help, short = Short)
