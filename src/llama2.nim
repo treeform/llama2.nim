@@ -1,7 +1,12 @@
 import cligen, std/tables, std/times, math, std/algorithm, std/strutils,
-    std/streams, std/os, std/memfiles
+    std/streams, std/os, std/memfiles, std/rdstdin, nimsimd/avx2
+
+
 
 {.passC: "-Ofast -funsafe-math-optimizations -ffast-math -mtune=native -march=native".}
+
+when defined(gcc) or defined(clang):
+  {.localPassc: "-mavx2".}
 
 type
   Config = object
@@ -11,7 +16,7 @@ type
     numHeads: cint       # number of query heads
     numKVHeads: cint    # number of key/value heads (can be < query heads because of multiquery)
     vocabSize: cint    # vocabulary size, usually 256 (byte-level)
-    seq_len: cint       # max sequence length
+    seqLen: cint       # max sequence length
 
   TransformerWeights = object
     # token embedding table
@@ -43,11 +48,11 @@ type
     q: ptr[float32]   # query (dim,)
     k: ptr[float32]   # key (dim,)
     v: ptr[float32]   # value (dim,)
-    att: ptr[float32] # buffer for scores/attention values (numHeads, seq_len)
+    att: ptr[float32] # buffer for scores/attention values (numHeads, seqLen)
     logits: ptr[float32] # output logits
     # kv cache
-    key_cache: ptr[float32]   # (layer, seq_len, dim)
-    value_cache: ptr[float32] # (layer, seq_len, dim)
+    key_cache: ptr[float32]   # (layer, seqLen, dim)
+    value_cache: ptr[float32] # (layer, seqLen, dim)
 
   Transformer = ref object
     config: Config              # the hyperparameters of the architecture (the blueprint)
@@ -134,9 +139,9 @@ proc newTransformer(checkpointPath: string): Transformer =
   t.weights.w3 = readFloats(c.numLayers * c.dim * c.hiddenDim)
   t.weights.rms_final_weight = readFloats(c.dim)
   # Skipping unused t.weights.freq_cis_real
-  discard readFloats(c.seq_len * (c.dim div c.numHeads) div 2)
+  discard readFloats(c.seqLen * (c.dim div c.numHeads) div 2)
   # Skipping unused t.weights.freq_cis_imag =
-  discard readFloats(c.seq_len * (c.dim div c.numHeads) div 2)
+  discard readFloats(c.seqLen * (c.dim div c.numHeads) div 2)
   if shared_weights:
     t.weights.wcls = t.weights.token_embedding_table
   else:
@@ -153,10 +158,10 @@ proc newTransformer(checkpointPath: string): Transformer =
   t.state.q = cast[ptr float32](alloc0(c.dim * sizeof(float32)))
   t.state.k = cast[ptr float32](alloc0(kvDim * sizeof(float32)))
   t.state.v = cast[ptr float32](alloc0(kvDim * sizeof(float32)))
-  t.state.att = cast[ptr float32](alloc0(c.numHeads * c.seq_len * sizeof(float32)))
+  t.state.att = cast[ptr float32](alloc0(c.numHeads * c.seqLen * sizeof(float32)))
   t.state.logits = cast[ptr float32](alloc0(c.vocabSize * sizeof(float32)))
-  t.state.key_cache = cast[ptr float32](alloc0(c.numLayers * c.seq_len * kvDim * sizeof(float32)))
-  t.state.value_cache = cast[ptr float32](alloc0(c.numLayers * c.seq_len * kvDim * sizeof(float32)))
+  t.state.key_cache = cast[ptr float32](alloc0(c.numLayers * c.seqLen * kvDim * sizeof(float32)))
+  t.state.value_cache = cast[ptr float32](alloc0(c.numLayers * c.seqLen * kvDim * sizeof(float32)))
 
   return t
 
@@ -296,13 +301,111 @@ proc matMul(xout: ptr float32, x: ptr float32, w: ptr float32, n: cint, d: cint)
   # W (d,n) @ x (n,) -> xout (d,)
   # by far the most amount of time is spent inside this little function
 
-  #echo "matMul ", $n, "x", $d
+  # echo "matMul ", $n, "x", $d
 
   for i in 0 ..< d:
     var val = 0.0'f32
     for j in 0 ..< n:
       val += w[i * n + j] * x[j]
     xout[i] = val
+
+# proc matMul(xout: ptr float32, x: ptr float32, w: ptr float32, n: cint, d: cint) =
+#   # W (d,n) @ x (n,) -> xout (d,)
+#   # by far the most amount of time is spent inside this little function
+
+#   # echo "matMul ", $n, "x", $d
+
+#   for i in 0 ..< d:
+
+#     var
+#       val0 = 0.0'f32
+#       val1 = 0.0'f32
+#       val2 = 0.0'f32
+#       val3 = 0.0'f32
+
+#     var j = 0
+#     let offset = i * n
+#     while j < n:
+#       val0 += w[offset + j+0] * x[j+0]
+#       val1 += w[offset + j+1] * x[j+1]
+#       val2 += w[offset + j+2] * x[j+2]
+#       val3 += w[offset + j+3] * x[j+3]
+#       j += 4
+#     while j < n:
+#       val0 += w[offset + j] * x[j]
+#       inc j
+
+#     xout[i] = val0 + val1 + val2 + val3
+
+{.push header: "immintrin.h".}
+func mm_fmadd_ps*(a, b, c: M128): M128 {.importc: "_mm_fmadd_ps".}
+func mm256_fmadd_ps*(a, b, c: M256): M256 {.importc: "_mm256_fmadd_ps".}
+{.pop.}
+
+var matMullRead: int
+
+# proc matMul(xout: ptr float32, x: ptr float32, w: ptr float32, n: cint, d: cint) =
+#   # W (d,n) @ x (n,) -> xout (d,)
+#   # by far the most amount of time is spent inside this little function
+
+#   # echo "matMul ", $n, "x", $d
+
+#   matMullRead += d * n * 4 * 2
+
+#   # if d == n:
+#   #   discard
+#   # elif d > n:
+#   #   echo "flip!", d, " x ", n
+#   # else:
+#   #   echo "good", d, " x ", n
+
+#   let
+#     x = cast[ptr UncheckedArray[float32]](x)
+#     w = cast[ptr UncheckedArray[float32]](w)
+
+#   for i in 0 ..< d:
+
+#     var
+#       val: M256
+#       val0: float32
+#       j = 0
+#     let offset = i * n
+#     while j < n:
+#       let
+#         wv = mm256_loadu_ps(w[offset + j].addr)
+#         xv = mm256_loadu_ps(x[j].addr)
+#       val = mm256_fmadd_ps(wv, xv, val)
+#       j += 8
+
+#     while j < n:
+#       val0 += w[offset + j] * x[j]
+#       inc j
+
+#     var tmp = cast[array[8, float32]](val)
+#     for i in 0 ..< 8:
+#       val0 += tmp[i]
+#     xout[i] = val0
+
+
+# proc matMul(xout: ptr float32, x: ptr float32, w: ptr float32, n: cint, d: cint) =
+#   # W (d,n) @ x (n,) -> xout (d,)
+#   # by far the most amount of time is spent inside this little function
+
+#   # echo "matMul ", $n, "x", $d
+
+#   if d <= n:
+#     for i in 0 ..< d:
+#       var val = 0.0'f32
+#       for j in 0 ..< n:
+#         val += w[i * n + j] * x[j]
+#       xout[i] = val
+#   else:
+#     for i in 0 ..< d:
+#       xout[i] = 0
+
+#     for j in 0 ..< n:
+#       for i in 0 ..< d:
+#         xout[i] = xout[i] + w[i * n + j] * x[j]
 
 proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
   # Convenience variables
@@ -386,7 +489,7 @@ proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
         # Get the attention weight for this timestep
         let a = att[t]
         # Accumulate the weighted value into xb
-        for i in 0..<headSize:
+        for i in 0 ..< headSize:
           xb[i] = xb[i] + a * v[i]
 
     # Final matMul to get the output of the attention
@@ -572,6 +675,9 @@ proc generate(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, 
 
     var logits: ptr float32 = forward(transformer, token, pos)
 
+    # echo "matMullRead: ", matMullRead / 1024 / 1024 / 1024, "GB"
+    # matMullRead = 0
+
     # advance the state state machine
     if pos < promptTokens.len - 1:
       # if we are still processing the input prompt, force the next prompt token
@@ -588,7 +694,8 @@ proc generate(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, 
     # print the token as string, decode it with the Tokenizer object
     let piece = decode(tokenizer, token, next)
 
-    if piece == "</s>":
+    #echo "`", piece, "`"
+    if "</s>" in piece:
       break
 
     if interactive:
@@ -609,53 +716,70 @@ proc generate(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, 
     let endTime = epochTime()
     echo "achieved tok/s: ", $(pos.float/(endTime - startTime))
 
+proc chat(
+  transformer: Transformer,
+  tokenizer: Tokenizer,
+  sampler: Sampler,
+  prompt: string,
+  systemPrompt: string,
+  steps: cint
+) =
+  ## Given a loaded model, generates the output.
+
+  while true:
+    let prompt = readLineFromStdin(">>> ")
+    if prompt in ["q", "quit", "exit"]:
+      break
+
+    discard generate(transformer, tokenizer, sampler, prompt, steps)
+
+
 const
   Help  = {
     "model": "Model file",
     "temperature": "temperature in [0,inf], default 1.0",
-    "pvalue": "p value in top-p (nucleus) sampling in [0,1] default 0.9",
+    "pValue": "p value in top-p (nucleus) sampling in [0,1] default 0.9",
     "seed": "random seed, default time(NULL)",
     "steps": "number of steps to run for, default 256. 0 = max_seq_len",
     "input": "input prompt",
     "tokenizer": "optional path to custom tokenizer",
     "mode": "mode: generate|chat, default: generate",
-    "sysPrompt": "(optional) system prompt in chat mode"
+    "systemPrompt": "(optional) system prompt in chat mode"
   }.toTable()
 
   Short = {
     "model": 'm',
     "temperature": 't',
-    "pvalue": 'p',
+    "pValue": 'p',
     "seed": 's',
     "steps": 'n',
     "input": 'i',
     "tokenizer": 'z',
     "mode": 'd',
-    "sysPrompt": 'y'
+    "systemPrompt": 'y'
   }.toTable()
 
 proc main*(
-  model: string,
+  model: string = "stories15M.bin",
   temperature: float32 = 1.0,
-  pvalue: float32 = 0.9,
-  seed: int = int(getTime().toUnix),  # Default to current Unix time
+  pValue: float32 = 0.9,
+  seed: int = 123, #int(getTime().toUnix),  # Default to current Unix time
   steps: int = 256,
-  input: string = "",
+  input: string = "Mommy said ",
   tokenizer: string = "tokenizer.bin",
   mode: string = "generate",
-  sysPrompt: string = "Only short answers"
+  systemPrompt: string = "Only short answers"
 ) =
 
   var
-    checkpoint_path = model
-    tokenizer_path = tokenizer
+    checkpointPath = model
+    tokenizerPath = tokenizer
     temperature = temperature
-    topp = pvalue
+    topp = pValue
     steps = steps
     prompt = input
     rngSeed = seed
-    mode = mode
-    system_prompt = sysPrompt
+
 
   if rngSeed <= 0:
     rngSeed = int(getTime().toUnix)
@@ -667,10 +791,10 @@ proc main*(
     steps = 0
 
   echo "build the Transformer via the model .bin file"
-  var transformer = newTransformer(checkpoint_path)
+  var transformer = newTransformer(checkpointPath)
 
   echo "build the Tokenizer via the tokenizer .bin file"
-  var tokenizer = newTokenizer(tokenizer_path, transformer.config.vocabSize)
+  var tokenizer = newTokenizer(tokenizerPath, transformer.config.vocabSize)
 
   echo "build the Sampler"
   var sampler = newSampler(transformer.config.vocabSize, temperature, topp, rngSeed.uint64)
@@ -685,15 +809,15 @@ proc main*(
       prompt,
       steps.cint
     )
-  # elif mode == "chat":
-  #   chat(
-  #     transformer.addr,
-  #     tokenizer.addr,
-  #     sampler.addr,
-  #     nil,
-  #     system_prompt.cstring,
-  #     steps.cint
-  #   )
+  elif mode == "chat":
+    chat(
+      transformer,
+      tokenizer,
+      sampler,
+      prompt,
+      systemPrompt,
+      steps.cint
+    )
   else:
     quit("Use a valid mode")
 
