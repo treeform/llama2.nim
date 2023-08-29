@@ -11,25 +11,25 @@ type
     numHeads: cint       # number of query heads
     numKVHeads: cint    # number of key/value heads (can be < query heads because of multiquery)
     vocabSize: cint    # vocabulary size, usually 256 (byte-level)
-    seq_len: cint       # max sequence length
+    seqLen: cint       # max sequence length
 
   TransformerWeights = object
     # token embedding table
-    token_embedding_table: ptr[float32]    # (vocabSize, dim)
+    tokenEmbeddingTable: ptr[float32]    # (vocabSize, dim)
     # weights for rmsNorms
-    rms_att_weight: ptr[float32] # (layer, dim) rmsNorm weights
-    rms_ffn_weight: ptr[float32] # (layer, dim)
-    # weights for matMuls. note dim == numHeads * head_size
-    wq: ptr[float32] # (layer, dim, numHeads * head_size)
-    wk: ptr[float32] # (layer, dim, numKVHeads * head_size)
-    wv: ptr[float32] # (layer, dim, numKVHeads * head_size)
-    wo: ptr[float32] # (layer, numHeads * head_size, dim)
+    rmsAttWeight: ptr[float32] # (layer, dim) rmsNorm weights
+    rmsFfnWeight: ptr[float32] # (layer, dim)
+    # weights for matMuls. note dim == numHeads * headSize
+    wq: ptr[float32] # (layer, dim, numHeads * headSize)
+    wk: ptr[float32] # (layer, dim, numKVHeads * headSize)
+    wv: ptr[float32] # (layer, dim, numKVHeads * headSize)
+    wo: ptr[float32] # (layer, numHeads * headSize, dim)
     # weights for ffn
     w1: ptr[float32] # (layer, hiddenDim, dim)
     w2: ptr[float32] # (layer, dim, hiddenDim)
     w3: ptr[float32] # (layer, hiddenDim, dim)
     # final rmsNorm
-    rms_final_weight: ptr[float32] # (dim,)
+    rmsFinalWeight: ptr[float32] # (dim,)
     # (optional) classifier weights for the logits, on the last layer
     wcls: ptr[float32]
 
@@ -43,11 +43,11 @@ type
     q: ptr[float32]   # query (dim,)
     k: ptr[float32]   # key (dim,)
     v: ptr[float32]   # value (dim,)
-    att: ptr[float32] # buffer for scores/attention values (numHeads, seq_len)
+    att: ptr[float32] # buffer for scores/attention values (numHeads, seqLen)
     logits: ptr[float32] # output logits
     # kv cache
-    key_cache: ptr[float32]   # (layer, seq_len, dim)
-    value_cache: ptr[float32] # (layer, seq_len, dim)
+    keyCache: ptr[float32]   # (layer, seqLen, dim)
+    valueCache: ptr[float32] # (layer, seqLen, dim)
 
   Transformer = ref object
     config: Config              # the hyperparameters of the architecture (the blueprint)
@@ -63,11 +63,11 @@ type
 
   Tokenizer = ref object
     vocab: ptr[ptr[char]] # Equivalent of char** in Nim
-    vocab_scores: ptr[float32]
-    sorted_vocab: ptr[TokenIndex]
+    vocabScores: ptr[float32]
+    sortedVocab: ptr[TokenIndex]
     vocabSize: cint
-    max_token_length: uint32      # Equivalent of unsigned int in Nim
-    byte_pieces: array[512, uint8] # Equivalent of unsigned char[512] in Nim
+    maxTokenLength: uint32      # Equivalent of unsigned int in Nim
+    bytePieces: array[512, uint8] # Equivalent of unsigned char[512] in Nim
 
 type
   ProbIndex = object
@@ -112,7 +112,7 @@ proc newTransformer(checkpointPath: string): Transformer =
   var c: Config
   readObj(c)
 
-  let shared_weights =
+  let sharedWeights =
     if c.vocabSize > 0:
       true
     else:
@@ -122,23 +122,23 @@ proc newTransformer(checkpointPath: string): Transformer =
 
   t.fileSize = f.size
 
-  t.weights.token_embedding_table = readFloats(c.vocabSize * c.dim)
-  t.weights.rms_att_weight = readFloats(c.numLayers * c.dim)
+  t.weights.tokenEmbeddingTable = readFloats(c.vocabSize * c.dim)
+  t.weights.rmsAttWeight = readFloats(c.numLayers * c.dim)
   t.weights.wq = readFloats(c.numLayers * c.dim * c.dim)
   t.weights.wk = readFloats(c.numLayers * c.dim * c.dim)
   t.weights.wv = readFloats(c.numLayers * c.dim * c.dim)
   t.weights.wo = readFloats(c.numLayers * c.dim * c.dim)
-  t.weights.rms_ffn_weight = readFloats(c.numLayers * c.dim)
+  t.weights.rmsFfnWeight = readFloats(c.numLayers * c.dim)
   t.weights.w1 = readFloats(c.numLayers * c.dim * c.hiddenDim)
   t.weights.w2 = readFloats(c.numLayers * c.hiddenDim * c.dim)
   t.weights.w3 = readFloats(c.numLayers * c.dim * c.hiddenDim)
-  t.weights.rms_final_weight = readFloats(c.dim)
-  # Skipping unused t.weights.freq_cis_real
-  discard readFloats(c.seq_len * (c.dim div c.numHeads) div 2)
-  # Skipping unused t.weights.freq_cis_imag =
-  discard readFloats(c.seq_len * (c.dim div c.numHeads) div 2)
-  if shared_weights:
-    t.weights.wcls = t.weights.token_embedding_table
+  t.weights.rmsFinalWeight = readFloats(c.dim)
+  # Skipping unused t.weights.freqCisReal
+  discard readFloats(c.seqLen * (c.dim div c.numHeads) div 2)
+  # Skipping unused t.weights.freqCisImag =
+  discard readFloats(c.seqLen * (c.dim div c.numHeads) div 2)
+  if sharedWeights:
+    t.weights.wcls = t.weights.tokenEmbeddingTable
   else:
     # The rest of the file
     t.weights.wcls = cast[ptr float32](filePosition)
@@ -153,10 +153,10 @@ proc newTransformer(checkpointPath: string): Transformer =
   t.state.q = cast[ptr float32](alloc0(c.dim * sizeof(float32)))
   t.state.k = cast[ptr float32](alloc0(kvDim * sizeof(float32)))
   t.state.v = cast[ptr float32](alloc0(kvDim * sizeof(float32)))
-  t.state.att = cast[ptr float32](alloc0(c.numHeads * c.seq_len * sizeof(float32)))
+  t.state.att = cast[ptr float32](alloc0(c.numHeads * c.seqLen * sizeof(float32)))
   t.state.logits = cast[ptr float32](alloc0(c.vocabSize * sizeof(float32)))
-  t.state.key_cache = cast[ptr float32](alloc0(c.numLayers * c.seq_len * kvDim * sizeof(float32)))
-  t.state.value_cache = cast[ptr float32](alloc0(c.numLayers * c.seq_len * kvDim * sizeof(float32)))
+  t.state.keyCache = cast[ptr float32](alloc0(c.numLayers * c.seqLen * kvDim * sizeof(float32)))
+  t.state.valueCache = cast[ptr float32](alloc0(c.numLayers * c.seqLen * kvDim * sizeof(float32)))
 
   return t
 
@@ -167,15 +167,15 @@ proc newTokenizer(tokenizerPath: string, vocabSize: cint): Tokenizer =
   t.vocabSize = vocabSize
 
   t.vocab = cast[ptr ptr char](alloc0(vocabSize * sizeof(ptr char)))
-  t.vocab_scores = cast[ptr float32](alloc0(vocabSize * sizeof(float32)))
+  t.vocabScores = cast[ptr float32](alloc0(vocabSize * sizeof(float32)))
 
   for i in 0..255:
-    t.byte_pieces[i * 2] = i.uint8
-    t.byte_pieces[i * 2 + 1] = 0.uint8
+    t.bytePieces[i * 2] = i.uint8
+    t.bytePieces[i * 2 + 1] = 0.uint8
 
-  t.max_token_length = f.readUInt32()
+  t.maxTokenLength = f.readUInt32()
   for i in 0 ..< vocabSize:
-    t.vocab_scores[i] = f.readFloat32()
+    t.vocabScores[i] = f.readFloat32()
     let len = f.readInt32()
     let bstr = f.readStr(len)
     t.vocab[i] = cast[ptr char](alloc0(len+1))
@@ -186,7 +186,7 @@ proc newTokenizer(tokenizerPath: string, vocabSize: cint): Tokenizer =
 
   return t
 
-proc decode(t: Tokenizer, prev_token: cint, token: cint): string =
+proc decode(t: Tokenizer, prevToken: cint, token: cint): string =
   ## Takes a tokenID and turns it into a string part.
   var piece = t.vocab[token]
   for i in 0 .. 32:
@@ -194,7 +194,7 @@ proc decode(t: Tokenizer, prev_token: cint, token: cint): string =
       break
     result.add piece[i]
 
-  if prev_token == 1 and result[0] == ' ':
+  if prevToken == 1 and result[0] == ' ':
     result = result[1 .. ^1]
 
   if result == "<0x0A>":
@@ -236,7 +236,7 @@ proc encode(t: Tokenizer, text: string): seq[cint] =
       quit("Error encoding")
     tokens.add(tokenId.cint)
 
-  # Merge the best consecutive pair each iteration, according to the scores in vocab_scores
+  # Merge the best consecutive pair each iteration, according to the scores in vocabScores
   while true:
     var
       bestScore = float32.low
@@ -247,9 +247,9 @@ proc encode(t: Tokenizer, text: string): seq[cint] =
       # Check if we can merge the pair (tokens[i], tokens[i+1])
       var str = t.getToken(tokens[i]) & t.getToken(tokens[i + 1])
       let tokenId = t.findToken(str)
-      if tokenId != -1 and t.vocab_scores[tokenId] > bestScore:
+      if tokenId != -1 and t.vocabScores[tokenId] > bestScore:
         # This merge pair exists in vocab! Record its score and position
-        bestScore = t.vocab_scores[tokenId]
+        bestScore = t.vocabScores[tokenId]
         bestId = tokenId
         bestIdx = i.cint
 
@@ -314,17 +314,17 @@ proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
   let kvDim = (p.dim * p.numKVHeads) div p.numHeads
   let kvMul = p.numHeads div p.numKVHeads  # Integer multiplier of the kv sharing in multiquery
   let hiddenDim = p.hiddenDim
-  let head_size = dim div p.numHeads
+  let headSize = dim div p.numHeads
 
   # Copy the token embedding into x
-  let contentRow = w.token_embedding_table + token * dim
+  let contentRow = w.tokenEmbeddingTable + token * dim
   copyMem(x, contentRow, dim * sizeof(x[]))
 
   # Forward all the layers
   for l in 0 ..< p.numLayers:
 
     # Attention rmsNorm
-    rmsNorm(s.xb, x, w.rms_att_weight + l*dim, dim)
+    rmsNorm(s.xb, x, w.rmsAttWeight + l*dim, dim)
 
     # QKV matMuls for this position
     matMul(s.q, s.xb, w.wq + l*dim*dim, dim, dim)
@@ -397,7 +397,7 @@ proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
       x[i] = x[i] + s.xb2[i]
 
     # FFN rmsNorm
-    rmsNorm(s.xb, x, w.rms_ffn_weight + l * dim, dim)
+    rmsNorm(s.xb, x, w.rmsFfnWeight + l * dim, dim)
 
     # Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     # First calculate self.w1(x) and self.w3(x)
@@ -421,7 +421,7 @@ proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
       x[i] = x[i] + s.xb[i]
 
   # Final rmsNorm
-  rmsNorm(x, x, w.rms_final_weight, dim)
+  rmsNorm(x, x, w.rmsFinalWeight, dim)
 
   # Classifier into logits
   matMul(s.logits, x, w.wcls, p.dim, p.vocabSize)
@@ -509,23 +509,23 @@ proc sampleTopP(probabilities: ptr float32, n: cint, topp: float32, probIndex: p
   for i in 0 ..< n0: probIndex[i] = probIndexSeq[i]
 
   # truncate the list where cumulative probability exceeds topp
-  var cumulative_prob = 0.0'f32
-  var last_idx = n0 - 1  # in case of rounding errors consider all elements
+  var cumulativeProb = 0.0'f32
+  var lastIdx = n0 - 1  # in case of rounding errors consider all elements
   for i in 0..<n0:
-    cumulative_prob += probIndex[i].prob
-    if cumulative_prob > topp:
-      last_idx = i
-      break  # we've exceeded topp by including last_idx
+    cumulativeProb += probIndex[i].prob
+    if cumulativeProb > topp:
+      lastIdx = i
+      break  # we've exceeded topp by including lastIdx
 
   # sample from the truncated list
-  let r = coin * cumulative_prob
+  let r = coin * cumulativeProb
   var cdf = 0.0'f32
-  for i in 0 ..< last_idx + 1:
+  for i in 0 ..< lastIdx + 1:
     cdf += probIndex[i].prob
     if r < cdf:
       return probIndex[i].index
 
-  return probIndex[last_idx].index  # in case of rounding errors
+  return probIndex[lastIdx].index  # in case of rounding errors
 
 proc sample(sampler: Sampler, logits: ptr float32): cint =
   # Sample the token given the logits and some hyperparameters
@@ -588,7 +588,7 @@ proc generate(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, 
     # print the token as string, decode it with the Tokenizer object
     let piece = decode(tokenizer, token, next)
 
-    if piece == "</s>":
+    if "</s>" in piece:
       break
 
     if interactive:
@@ -615,7 +615,7 @@ const
     "temperature": "temperature in [0,inf], default 1.0",
     "pvalue": "p value in top-p (nucleus) sampling in [0,1] default 0.9",
     "seed": "random seed, default time(NULL)",
-    "steps": "number of steps to run for, default 256. 0 = max_seq_len",
+    "steps": "number of steps to run for, default 256. 0 = maxSeqLen",
     "input": "input prompt",
     "tokenizer": "optional path to custom tokenizer",
     "mode": "mode: generate|chat, default: generate",
@@ -647,15 +647,15 @@ proc main*(
 ) =
 
   var
-    checkpoint_path = model
-    tokenizer_path = tokenizer
+    checkpointPath = model
+    tokenizerPath = tokenizer
     temperature = temperature
     topp = pvalue
     steps = steps
     prompt = input
     rngSeed = seed
     mode = mode
-    system_prompt = sysPrompt
+    systemPrompt = sysPrompt
 
   if rngSeed <= 0:
     rngSeed = int(getTime().toUnix)
@@ -667,10 +667,10 @@ proc main*(
     steps = 0
 
   echo "build the Transformer via the model .bin file"
-  var transformer = newTransformer(checkpoint_path)
+  var transformer = newTransformer(checkpointPath)
 
   echo "build the Tokenizer via the tokenizer .bin file"
-  var tokenizer = newTokenizer(tokenizer_path, transformer.config.vocabSize)
+  var tokenizer = newTokenizer(tokenizerPath, transformer.config.vocabSize)
 
   echo "build the Sampler"
   var sampler = newSampler(transformer.config.vocabSize, temperature, topp, rngSeed.uint64)
@@ -691,7 +691,7 @@ proc main*(
   #     tokenizer.addr,
   #     sampler.addr,
   #     nil,
-  #     system_prompt.cstring,
+  #     systemPrompt.cstring,
   #     steps.cint
   #   )
   else:
