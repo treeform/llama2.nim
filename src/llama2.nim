@@ -1,5 +1,5 @@
 import std/tables, std/times, math, std/algorithm, std/strutils,
-    std/streams, std/memfiles, std/parseopt
+    std/streams, std/memfiles, std/parseopt, std/rdstdin
 
 {.passC: "-Ofast -funsafe-math-optimizations -ffast-math -mtune=native -march=native".}
 
@@ -193,10 +193,10 @@ proc encode*(t: Tokenizer, text: string): seq[int32] =
   var text = " " & text
 
   # First encode every individual character in the input text
-  for c in text:
+  for c in text.replace("\n", "<0x0A>"):
     let tokenId = t.vocabRev.getOrDefault($c, -1)
     if tokenId == -1:
-      quit("Error encoding")
+      quit("Error encoding: " & repr(c))
     tokens.add(tokenId.int32)
 
   # Merge the best consecutive pair each iteration, according to the scores in vocabScores
@@ -571,6 +571,57 @@ proc generate*(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler,
     let endTime = epochTime()
     echo "achieved tok/s: ", $(pos.float/(endTime - startTime))
 
+proc chat(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, userPrompt: string, systemPrompt: string, steps: int) =
+
+  var
+    promptTokens = newSeq[cint](1152)
+    userIdx: cint
+
+  var
+    userTurn: int8 = 1
+    next, token, prevToken, pos: cint
+
+  while pos < steps:
+    if userTurn == 1:
+
+      let prompt =
+        if pos == 0 and userPrompt != "":
+          userPrompt
+        else:
+          readLineFromStdin("User: ")
+      let renderedPrompt =
+        if pos == 0 and systemPrompt != "":
+          "[INST] <<SYS>>\n" & systemPrompt & "\n<</SYS>>\n\n" & prompt & " [/INST]"
+        else:
+          "[INST] " & prompt & " [/INST]"
+
+      promptTokens = encode(tokenizer, renderedPrompt)
+
+      userIdx = 0
+      userTurn = 0
+      stdout.write("Assistant:")
+      stdout.flushFile()
+
+    if userIdx < promptTokens.len:
+      token = promptTokens[userIdx]
+      inc(userIdx)
+    else:
+      token = next
+    if token == 2:
+      userTurn = 1
+
+    let logits = forward(transformer, token, pos)
+    next = sample(sampler, logits)
+    inc(pos)
+
+    if userIdx >= promptTokens.len and next != 2:
+      let piece = decode(tokenizer, token, next)
+      stdout.write(piece)
+      stdout.flushFile()
+    if next == 2:
+      echo("")
+  echo("")
+
 const
   Help  = {
     "model": "Model file",
@@ -605,7 +656,7 @@ proc main*(
   input: string = "",
   tokenizer: string = "tokenizer.bin",
   mode: string = "generate",
-  sysPrompt: string = "Only short answers"
+  sysPrompt: string = ""
 ) =
   ## Main function
   var
@@ -648,15 +699,15 @@ proc main*(
       steps.int32,
       interactive = true
     )
-  # elif mode == "chat":
-  #   chat(
-  #     transformer.addr,
-  #     tokenizer.addr,
-  #     sampler.addr,
-  #     nil,
-  #     systemPrompt.cstring,
-  #     steps.int32
-  #   )
+  elif mode == "chat":
+    chat(
+      transformer,
+      tokenizer,
+      sampler,
+      prompt,
+      systemPrompt,
+      steps.int32
+    )
   else:
     quit("Use a valid mode")
 
@@ -671,7 +722,7 @@ when isMainModule:
     input = ""
     tokenizer = "tokenizer.bin"
     mode = "generate"
-    sysPrompt = "Only short answers"
+    sysPrompt = ""
 
   for kind, key, val in getopt():
     case kind
