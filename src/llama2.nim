@@ -5,11 +5,11 @@ import cligen, std/tables, std/times, math, std/algorithm, std/strutils,
 
 type
   Config = object
-    dim: int32           # transformer dimension
+    dim: int32          # transformer dimension
     hiddenDim: int32    # for ffn layers
-    numLayers: int32      # number of layers
-    numHeads: int32       # number of query heads
-    numKVHeads: int32    # number of key/value heads (can be < query heads because of multiquery)
+    numLayers: int32    # number of layers
+    numHeads: int32     # number of query heads
+    numKVHeads: int32   # number of key/value heads (can be < query heads because of multiquery)
     vocabSize: int32    # vocabulary size, usually 256 (byte-level)
     seqLen: int32       # max sequence length
 
@@ -160,19 +160,15 @@ proc newTokenizer(tokenizerPath: string, vocabSize: int32): Tokenizer =
   let t = Tokenizer()
   let f = newFileStream(tokenizerPath)
   t.vocabSize = vocabSize
-
   t.vocab = newSeq[string](vocabSize)
   t.vocabScores = newSeq[float32](vocabSize)
-
   t.maxTokenLength = f.readUInt32()
   for i in 0 ..< vocabSize:
     t.vocabScores[i] = f.readFloat32()
     let len = f.readInt32()
     t.vocab[i] = f.readStr(len)
     t.vocabRev[t.vocab[i]] = i
-
   f.close()
-
   return t
 
 proc decode(t: Tokenizer, prevToken: int32, token: int32): string =
@@ -188,7 +184,6 @@ proc decode(t: Tokenizer, prevToken: int32, token: int32): string =
 
 proc encode(t: Tokenizer, text: string): seq[int32] =
   ## Takes a string and encodes it into seq of token Ids.
-
   var tokens: seq[int32]
   tokens.add 1
 
@@ -231,8 +226,8 @@ proc encode(t: Tokenizer, text: string): seq[int32] =
 
   return tokens
 
-proc rmsNorm(o: ptr float32, x: ptr float32, weight: ptr float32, size: int32) =
-  # Calculate sum of squares
+proc rmsNorm(dest: ptr float32, x: ptr float32, weight: ptr float32, size: int32) =
+  ## Calculate sum of squares
   var ss = 0.0'f32
   for j in 0 ..< size:
     ss += x[j] * x[j]
@@ -241,10 +236,10 @@ proc rmsNorm(o: ptr float32, x: ptr float32, weight: ptr float32, size: int32) =
   ss = 1.0'f32 / sqrt(ss)
   # Normalize and scale
   for j in 0 ..< size:
-    o[j] = weight[j] * (ss * x[j])
+    dest[j] = weight[j] * (ss * x[j])
 
 proc softMax(x: ptr float32, size: int32) =
-  # Find max value (for numerical stability)
+  ## Find max value (for numerical stability)
   var maxVal = x[0]
   for i in 1 ..< size:
     if x[i] > maxVal:
@@ -260,19 +255,19 @@ proc softMax(x: ptr float32, size: int32) =
   for i in 0 ..< size:
     x[i] = x[i] / sum
 
-proc matMul(xout: ptr float32, x: ptr float32, w: ptr float32, n: int32, d: int32) =
+proc matMul(dest: ptr float32, x: ptr float32, w: ptr float32, n: int32, d: int32) =
+  ## Matrix vector multiply.
   # W (d,n) @ x (n,) -> xout (d,)
   # by far the most amount of time is spent inside this little function
-
-  #echo "matMul ", $n, "x", $d
-
   for i in 0 ..< d:
     var val = 0.0'f32
     for j in 0 ..< n:
       val += w[i * n + j] * x[j]
-    xout[i] = val
+    dest[i] = val
 
 proc forward(transformer: Transformer, token: int32, pos: int32): ptr float32 =
+  ## Forward pass of the neural network. The actual AI thinking part.
+
   # Convenience variables
   let p = addr transformer.config
   let w = addr transformer.weights
@@ -397,6 +392,7 @@ proc forward(transformer: Transformer, token: int32, pos: int32): ptr float32 =
   return s.logits
 
 proc newSampler(vocabSize: int32, temperature: float32, topp: float32, rngSeed: uint64): Sampler =
+  ## Creates new sampler.
   let sampler = Sampler()
   sampler.vocabSize = vocabSize
   sampler.temperature = temperature
@@ -407,21 +403,19 @@ proc newSampler(vocabSize: int32, temperature: float32, topp: float32, rngSeed: 
   return sampler
 
 proc sampleArgmax(probabilities: ptr float32, n: int32): int32 =
-  # return the index that has the highest probability
+  ## Returns the index that has the highest probability
   var
     maxI: int32 = 0
     maxP: float32 = probabilities[0]
-
   for i in 1 ..< n:
     if probabilities[i] > maxP:
       maxI = i
       maxP = probabilities[i]
-
   return maxI
 
 proc sampleMult(probabilities: ptr float32, n: int32, coin: float32): int32 =
-  # Sample index from probabilities (they must sum to 1!)
-  # Coin is a random number in [0, 1), usually from randomFloat32()
+  ## Sample index from probabilities (they must sum to 1!)
+  ## Coin is a random number in [0, 1), usually from randomFloat32()
   var cdf = 0.0'f32
   for i in 0 ..< n:
     cdf += probabilities[i]
@@ -440,7 +434,7 @@ proc randomUInt32(statePtr: ptr uint64): uint32 =
   statePtr[] = state
 
 proc randomFloat32(state: ptr uint64): float32 =
-  ## Compute andom float32 in [0,1)
+  ## Compute random float32 in [0,1)
   result = (randomUInt32(state) shr 8).float32 / 16777216.0'f32
 
 proc compare(a, b: ProbIndex): int =
@@ -496,7 +490,7 @@ proc sampleTopP(probabilities: ptr float32, n: int32, topp: float32, probIndex: 
   return probIndex[lastIdx].index  # in case of rounding errors
 
 proc sample(sampler: Sampler, logits: ptr float32): int32 =
-  # Sample the token given the logits and some hyperparameters
+  ## Sample the token given the logits and some hyperparameters
   var next: int32
   if sampler.temperature == 0.0'f32:
     # Greedy argmax sampling: take the token with the highest probability
@@ -613,7 +607,7 @@ proc main*(
   mode: string = "generate",
   sysPrompt: string = "Only short answers"
 ) =
-
+  ## Main function
   var
     checkpointPath = model
     tokenizerPath = tokenizer
@@ -666,4 +660,5 @@ proc main*(
     quit("Use a valid mode")
 
 when isMainModule:
+  # Only run main if this is the file is run directly
   dispatch(main, help = Help, short = Short)
