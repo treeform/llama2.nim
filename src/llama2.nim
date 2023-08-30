@@ -1,5 +1,5 @@
 import cligen, std/tables, std/times, math, std/algorithm, std/strutils,
-    std/streams, std/os, std/memfiles
+    std/streams, std/os, std/memfiles, std/tables
 
 {.passC: "-Ofast -funsafe-math-optimizations -ffast-math -mtune=native -march=native".}
 
@@ -57,17 +57,12 @@ type
     fileSize: int              # size of the checkpoint file in bytes
 
 type
-  TokenIndex = object
-    str: cstring  # Equivalent of char* in Nim
-    id: cint
-
   Tokenizer = ref object
-    vocab: ptr[ptr[char]] # Equivalent of char** in Nim
-    vocabScores: ptr[float32]
-    sortedVocab: ptr[TokenIndex]
+    vocab: seq[string]
+    vocabRev: Table[string, int]
+    vocabScores: seq[float32]
     vocabSize: cint
     maxTokenLength: uint32      # Equivalent of unsigned int in Nim
-    bytePieces: array[512, uint8] # Equivalent of unsigned char[512] in Nim
 
 type
   ProbIndex = object
@@ -166,21 +161,15 @@ proc newTokenizer(tokenizerPath: string, vocabSize: cint): Tokenizer =
   let f = newFileStream(tokenizerPath)
   t.vocabSize = vocabSize
 
-  t.vocab = cast[ptr ptr char](alloc0(vocabSize * sizeof(ptr char)))
-  t.vocabScores = cast[ptr float32](alloc0(vocabSize * sizeof(float32)))
-
-  for i in 0..255:
-    t.bytePieces[i * 2] = i.uint8
-    t.bytePieces[i * 2 + 1] = 0.uint8
+  t.vocab = newSeq[string](vocabSize)
+  t.vocabScores = newSeq[float32](vocabSize)
 
   t.maxTokenLength = f.readUInt32()
   for i in 0 ..< vocabSize:
     t.vocabScores[i] = f.readFloat32()
     let len = f.readInt32()
-    let bstr = f.readStr(len)
-    t.vocab[i] = cast[ptr char](alloc0(len+1))
-    for j in 0 ..< len:
-      t.vocab[i][j] = bstr[j]
+    t.vocab[i] = f.readStr(len)
+    t.vocabRev[t.vocab[i]] = i
 
   f.close()
 
@@ -189,34 +178,13 @@ proc newTokenizer(tokenizerPath: string, vocabSize: cint): Tokenizer =
 proc decode(t: Tokenizer, prevToken: cint, token: cint): string =
   ## Takes a tokenID and turns it into a string part.
   var piece = t.vocab[token]
-  for i in 0 .. 32:
-    if piece[i] == '\0':
-      break
-    result.add piece[i]
+  result.add piece
 
   if prevToken == 1 and result[0] == ' ':
     result = result[1 .. ^1]
 
   if result == "<0x0A>":
     result = "\n"
-
-proc getToken(t: Tokenizer, tokenId: cint): string =
-  ## Given a tokenId returns its string part.
-  var token = ""
-  var piece = t.vocab[tokenId]
-  for i in 0 .. 32:
-    if piece[i] == '\0':
-      break
-    token.add piece[i]
-  return token
-
-proc findToken(t: Tokenizer, stringPart: string): cint =
-  ## Given a token string part, returns its tokenId.
-  for tokenId in 0 ..< t.vocabSize:
-    var token = t.getToken(tokenId)
-    if token == stringPart:
-      return tokenId.cint
-  return -1
 
 proc encode(t: Tokenizer, text: string): seq[cint] =
   ## Takes a string and encodes it into seq of token Ids.
@@ -231,7 +199,7 @@ proc encode(t: Tokenizer, text: string): seq[cint] =
 
   # First encode every individual character in the input text
   for c in text:
-    let tokenId = t.findToken($c)
+    let tokenId = t.vocabRev.getOrDefault($c, -1)
     if tokenId == -1:
       quit("Error encoding")
     tokens.add(tokenId.cint)
@@ -245,8 +213,8 @@ proc encode(t: Tokenizer, text: string): seq[cint] =
 
     for i in 0 ..< tokens.len - 1:
       # Check if we can merge the pair (tokens[i], tokens[i+1])
-      var str = t.getToken(tokens[i]) & t.getToken(tokens[i + 1])
-      let tokenId = t.findToken(str)
+      var str = t.vocab[tokens[i]] & t.vocab[tokens[i + 1]]
+      let tokenId = t.vocabRev.getOrDefault(str, -1).cint
       if tokenId != -1 and t.vocabScores[tokenId] > bestScore:
         # This merge pair exists in vocab! Record its score and position
         bestScore = t.vocabScores[tokenId]
@@ -258,7 +226,7 @@ proc encode(t: Tokenizer, text: string): seq[cint] =
 
     # Merge the consecutive pair (bestIdx, bestIdx+1) into new token bestId
     tokens[bestIdx] = bestId
-    # Delete token at position bestIdx+1, shift the entire sequence back 1
+    # Delete token at position bestIdx+1
     tokens.delete(bestIdx + 1)
 
   return tokens
