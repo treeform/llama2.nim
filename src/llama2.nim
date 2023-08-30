@@ -5,13 +5,13 @@ import cligen, std/tables, std/times, math, std/algorithm, std/strutils,
 
 type
   Config = object
-    dim: cint           # transformer dimension
-    hiddenDim: cint    # for ffn layers
-    numLayers: cint      # number of layers
-    numHeads: cint       # number of query heads
-    numKVHeads: cint    # number of key/value heads (can be < query heads because of multiquery)
-    vocabSize: cint    # vocabulary size, usually 256 (byte-level)
-    seqLen: cint       # max sequence length
+    dim: int32           # transformer dimension
+    hiddenDim: int32    # for ffn layers
+    numLayers: int32      # number of layers
+    numHeads: int32       # number of query heads
+    numKVHeads: int32    # number of key/value heads (can be < query heads because of multiquery)
+    vocabSize: int32    # vocabulary size, usually 256 (byte-level)
+    seqLen: int32       # max sequence length
 
   TransformerWeights = object
     # token embedding table
@@ -61,16 +61,16 @@ type
     vocab: seq[string]
     vocabRev: Table[string, int]
     vocabScores: seq[float32]
-    vocabSize: cint
+    vocabSize: int32
     maxTokenLength: uint32      # Equivalent of unsigned int in Nim
 
 type
   ProbIndex = object
     prob: float32  # float in C
-    index: cint    # int in C
+    index: int32    # int in C
 
   Sampler = ref object
-    vocabSize: cint
+    vocabSize: int32
     probIndex: ptr[ProbIndex] # equivalent of ProbIndex* in C
     temperature: float32
     topp: float32
@@ -155,7 +155,7 @@ proc newTransformer(checkpointPath: string): Transformer =
 
   return t
 
-proc newTokenizer(tokenizerPath: string, vocabSize: cint): Tokenizer =
+proc newTokenizer(tokenizerPath: string, vocabSize: int32): Tokenizer =
   ## Creates a new tokenizer given path to a bin.
   let t = Tokenizer()
   let f = newFileStream(tokenizerPath)
@@ -175,7 +175,7 @@ proc newTokenizer(tokenizerPath: string, vocabSize: cint): Tokenizer =
 
   return t
 
-proc decode(t: Tokenizer, prevToken: cint, token: cint): string =
+proc decode(t: Tokenizer, prevToken: int32, token: int32): string =
   ## Takes a tokenID and turns it into a string part.
   var piece = t.vocab[token]
   result.add piece
@@ -186,10 +186,10 @@ proc decode(t: Tokenizer, prevToken: cint, token: cint): string =
   if result == "<0x0A>":
     result = "\n"
 
-proc encode(t: Tokenizer, text: string): seq[cint] =
+proc encode(t: Tokenizer, text: string): seq[int32] =
   ## Takes a string and encodes it into seq of token Ids.
 
-  var tokens: seq[cint]
+  var tokens: seq[int32]
   tokens.add 1
 
   if text == "":
@@ -202,24 +202,24 @@ proc encode(t: Tokenizer, text: string): seq[cint] =
     let tokenId = t.vocabRev.getOrDefault($c, -1)
     if tokenId == -1:
       quit("Error encoding")
-    tokens.add(tokenId.cint)
+    tokens.add(tokenId.int32)
 
   # Merge the best consecutive pair each iteration, according to the scores in vocabScores
   while true:
     var
       bestScore = float32.low
-      bestId = -1.cint
-      bestIdx = -1.cint
+      bestId = -1.int32
+      bestIdx = -1.int32
 
     for i in 0 ..< tokens.len - 1:
       # Check if we can merge the pair (tokens[i], tokens[i+1])
       var str = t.vocab[tokens[i]] & t.vocab[tokens[i + 1]]
-      let tokenId = t.vocabRev.getOrDefault(str, -1).cint
+      let tokenId = t.vocabRev.getOrDefault(str, -1).int32
       if tokenId != -1 and t.vocabScores[tokenId] > bestScore:
         # This merge pair exists in vocab! Record its score and position
         bestScore = t.vocabScores[tokenId]
         bestId = tokenId
-        bestIdx = i.cint
+        bestIdx = i.int32
 
     if bestIdx == -1:
       break  # We couldn't find any more pairs to merge, so we're done
@@ -231,7 +231,7 @@ proc encode(t: Tokenizer, text: string): seq[cint] =
 
   return tokens
 
-proc rmsNorm(o: ptr float32, x: ptr float32, weight: ptr float32, size: cint) =
+proc rmsNorm(o: ptr float32, x: ptr float32, weight: ptr float32, size: int32) =
   # Calculate sum of squares
   var ss = 0.0'f32
   for j in 0 ..< size:
@@ -243,7 +243,7 @@ proc rmsNorm(o: ptr float32, x: ptr float32, weight: ptr float32, size: cint) =
   for j in 0 ..< size:
     o[j] = weight[j] * (ss * x[j])
 
-proc softMax(x: ptr float32, size: cint) =
+proc softMax(x: ptr float32, size: int32) =
   # Find max value (for numerical stability)
   var maxVal = x[0]
   for i in 1 ..< size:
@@ -260,7 +260,7 @@ proc softMax(x: ptr float32, size: cint) =
   for i in 0 ..< size:
     x[i] = x[i] / sum
 
-proc matMul(xout: ptr float32, x: ptr float32, w: ptr float32, n: cint, d: cint) =
+proc matMul(xout: ptr float32, x: ptr float32, w: ptr float32, n: int32, d: int32) =
   # W (d,n) @ x (n,) -> xout (d,)
   # by far the most amount of time is spent inside this little function
 
@@ -272,7 +272,7 @@ proc matMul(xout: ptr float32, x: ptr float32, w: ptr float32, n: cint, d: cint)
       val += w[i * n + j] * x[j]
     xout[i] = val
 
-proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
+proc forward(transformer: Transformer, token: int32, pos: int32): ptr float32 =
   # Convenience variables
   let p = addr transformer.config
   let w = addr transformer.weights
@@ -323,7 +323,7 @@ proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
     copyMem(valueCacheRow, s.v, kvDim * sizeof(float32))
 
     # Multi-head attention. Iterate over all heads
-    # var h: cint
+    # var h: int32
     # pragma omp parallel for private(h)
     for h in 0 ..< p.numHeads:
       # Get the query vector for this head
@@ -396,7 +396,7 @@ proc forward(transformer: Transformer, token: cint, pos: cint): ptr float32 =
 
   return s.logits
 
-proc newSampler(vocabSize: cint, temperature: float32, topp: float32, rngSeed: uint64): Sampler =
+proc newSampler(vocabSize: int32, temperature: float32, topp: float32, rngSeed: uint64): Sampler =
   let sampler = Sampler()
   sampler.vocabSize = vocabSize
   sampler.temperature = temperature
@@ -406,10 +406,10 @@ proc newSampler(vocabSize: cint, temperature: float32, topp: float32, rngSeed: u
   sampler.probIndex = cast[ptr[ProbIndex]](alloc0(sampler.vocabSize * sizeof(ProbIndex)))
   return sampler
 
-proc sampleArgmax(probabilities: ptr float32, n: cint): cint =
+proc sampleArgmax(probabilities: ptr float32, n: int32): int32 =
   # return the index that has the highest probability
   var
-    maxI: cint = 0
+    maxI: int32 = 0
     maxP: float32 = probabilities[0]
 
   for i in 1 ..< n:
@@ -419,7 +419,7 @@ proc sampleArgmax(probabilities: ptr float32, n: cint): cint =
 
   return maxI
 
-proc sampleMult(probabilities: ptr float32, n: cint, coin: float32): cint =
+proc sampleMult(probabilities: ptr float32, n: int32, coin: float32): int32 =
   # Sample index from probabilities (they must sum to 1!)
   # Coin is a random number in [0, 1), usually from randomFloat32()
   var cdf = 0.0'f32
@@ -451,13 +451,13 @@ proc compare(a, b: ProbIndex): int =
     return 1
   return 0
 
-proc sampleTopP(probabilities: ptr float32, n: cint, topp: float32, probIndex: ptr ProbIndex, coin: float32): cint =
+proc sampleTopP(probabilities: ptr float32, n: int32, topp: float32, probIndex: ptr ProbIndex, coin: float32): int32 =
   # top-p sampling (or "nucleus sampling") samples from the smallest set of
   # tokens that exceed probability topp. This way we never sample tokens that
   # have very low probabilities and are less likely to go "off the rails".
   # coin is a random number in [0, 1), usually from randomFloat32()
 
-  var n0: cint = 0
+  var n0: int32 = 0
   # quicksort indices in descending order of probabilities
   # values smaller than (1 - topp) / (n - 1) cannot be part of the result
   # so for efficiency we crop these out as candidates before sorting
@@ -465,7 +465,7 @@ proc sampleTopP(probabilities: ptr float32, n: cint, topp: float32, probIndex: p
   for i in 0 ..< n:
     if probabilities[i] >= cutoff:
       var prob = ProbIndex()
-      prob.index = i.cint
+      prob.index = i.int32
       prob.prob = probabilities[i]
       probIndex[n0] = prob
       inc(n0)
@@ -495,9 +495,9 @@ proc sampleTopP(probabilities: ptr float32, n: cint, topp: float32, probIndex: p
 
   return probIndex[lastIdx].index  # in case of rounding errors
 
-proc sample(sampler: Sampler, logits: ptr float32): cint =
+proc sample(sampler: Sampler, logits: ptr float32): int32 =
   # Sample the token given the logits and some hyperparameters
-  var next: cint
+  var next: int32
   if sampler.temperature == 0.0'f32:
     # Greedy argmax sampling: take the token with the highest probability
     next = sampleArgmax(logits, sampler.vocabSize)
@@ -523,16 +523,16 @@ proc sample(sampler: Sampler, logits: ptr float32): cint =
       )
   return next
 
-proc generate(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, prompt: string, steps: cint, interactive = true): string =
+proc generate(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, prompt: string, steps: int32, interactive = true): string =
   ## Given a loaded model, generates the output.
 
   let promptTokens = encode(tokenizer, prompt)
 
   var
     startTime: float
-    next: cint
+    next: int32
     token = promptTokens[0] # kick off with the first token in the prompt
-    pos: cint = 0 # position in the sequence
+    pos: int32 = 0 # position in the sequence
 
   while pos < steps:
     # ... rest of the loop
@@ -651,7 +651,7 @@ proc main*(
       tokenizer,
       sampler,
       prompt,
-      steps.cint
+      steps.int32
     )
   # elif mode == "chat":
   #   chat(
@@ -660,7 +660,7 @@ proc main*(
   #     sampler.addr,
   #     nil,
   #     systemPrompt.cstring,
-  #     steps.cint
+  #     steps.int32
   #   )
   else:
     quit("Use a valid mode")
