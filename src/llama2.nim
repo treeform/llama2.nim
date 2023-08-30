@@ -1,17 +1,17 @@
-import cligen, std/tables, std/times, math, std/algorithm, std/strutils,
-    std/streams, std/os, std/memfiles, std/tables
+import std/tables, std/times, math, std/algorithm, std/strutils,
+    std/streams, std/memfiles, std/parseopt
 
 {.passC: "-Ofast -funsafe-math-optimizations -ffast-math -mtune=native -march=native".}
 
 type
   Config = object
-    dim: int32          # transformer dimension
-    hiddenDim: int32    # for ffn layers
-    numLayers: int32    # number of layers
-    numHeads: int32     # number of query heads
-    numKVHeads: int32   # number of key/value heads (can be < query heads because of multiquery)
-    vocabSize: int32    # vocabulary size, usually 256 (byte-level)
-    seqLen: int32       # max sequence length
+    dim*: int32          # transformer dimension
+    hiddenDim*: int32    # for ffn layers
+    numLayers*: int32    # number of layers
+    numHeads*: int32     # number of query heads
+    numKVHeads*: int32   # number of key/value heads (can be < query heads because of multiquery)
+    vocabSize*: int32    # vocabulary size, usually 256 (byte-level)
+    seqLen*: int32       # max sequence length
 
   TransformerWeights = object
     # token embedding table
@@ -49,15 +49,15 @@ type
     keyCache: ptr[float32]   # (layer, seqLen, dim)
     valueCache: ptr[float32] # (layer, seqLen, dim)
 
-  Transformer = ref object
-    config: Config              # the hyperparameters of the architecture (the blueprint)
-    weights: TransformerWeights # the weights of the model
-    state: RunState             # buffers for the "wave" of activations in the forward pass
+  Transformer* = ref object
+    config*: Config              # the hyperparameters of the architecture (the blueprint)
+    weights*: TransformerWeights # the weights of the model
+    state*: RunState             # buffers for the "wave" of activations in the forward pass
     # some more state needed to properly clean up the memory mapping (sigh)
-    fileSize: int              # size of the checkpoint file in bytes
+    fileSize*: int              # size of the checkpoint file in bytes
 
 type
-  Tokenizer = ref object
+  Tokenizer* = ref object
     vocab: seq[string]
     vocabRev: Table[string, int]
     vocabScores: seq[float32]
@@ -69,7 +69,7 @@ type
     prob: float32  # float in C
     index: int32    # int in C
 
-  Sampler = ref object
+  Sampler* = ref object
     vocabSize: int32
     probIndex: ptr[ProbIndex] # equivalent of ProbIndex* in C
     temperature: float32
@@ -90,7 +90,7 @@ proc `[]=`[T](p: ptr[T], n: SomeInteger, v: T) =
 proc `+`(p: pointer, n: SomeInteger): pointer =
   cast[pointer](cast[uint64](p) + n.uint64)
 
-proc newTransformer(checkpointPath: string): Transformer =
+proc newTransformer*(checkpointPath: string): Transformer =
   let t = Transformer()
   var f = memfiles.open(checkpointPath)
 
@@ -155,7 +155,7 @@ proc newTransformer(checkpointPath: string): Transformer =
 
   return t
 
-proc newTokenizer(tokenizerPath: string, vocabSize: int32): Tokenizer =
+proc newTokenizer*(tokenizerPath: string, vocabSize: int32): Tokenizer =
   ## Creates a new tokenizer given path to a bin.
   let t = Tokenizer()
   let f = newFileStream(tokenizerPath)
@@ -171,7 +171,7 @@ proc newTokenizer(tokenizerPath: string, vocabSize: int32): Tokenizer =
   f.close()
   return t
 
-proc decode(t: Tokenizer, prevToken: int32, token: int32): string =
+proc decode*(t: Tokenizer, prevToken: int32, token: int32): string =
   ## Takes a tokenID and turns it into a string part.
   var piece = t.vocab[token]
   result.add piece
@@ -182,7 +182,7 @@ proc decode(t: Tokenizer, prevToken: int32, token: int32): string =
   if result == "<0x0A>":
     result = "\n"
 
-proc encode(t: Tokenizer, text: string): seq[int32] =
+proc encode*(t: Tokenizer, text: string): seq[int32] =
   ## Takes a string and encodes it into seq of token Ids.
   var tokens: seq[int32]
   tokens.add 1
@@ -391,7 +391,7 @@ proc forward(transformer: Transformer, token: int32, pos: int32): ptr float32 =
 
   return s.logits
 
-proc newSampler(vocabSize: int32, temperature: float32, topp: float32, rngSeed: uint64): Sampler =
+proc newSampler*(vocabSize: int32, temperature: float32, topp: float32, rngSeed: uint64): Sampler =
   ## Creates new sampler.
   let sampler = Sampler()
   sampler.vocabSize = vocabSize
@@ -517,7 +517,7 @@ proc sample(sampler: Sampler, logits: ptr float32): int32 =
       )
   return next
 
-proc generate(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, prompt: string, steps: int32, interactive = true): string =
+proc generate*(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, prompt: string, steps: int32, interactive = false): string =
   ## Given a loaded model, generates the output.
 
   let promptTokens = encode(tokenizer, prompt)
@@ -645,7 +645,8 @@ proc main*(
       tokenizer,
       sampler,
       prompt,
-      steps.int32
+      steps.int32,
+      interactive = true
     )
   # elif mode == "chat":
   #   chat(
@@ -660,5 +661,49 @@ proc main*(
     quit("Use a valid mode")
 
 when isMainModule:
-  # Only run main if this is the file is run directly
-  dispatch(main, help = Help, short = Short)
+  # Default values
+  var
+    model = ""
+    temperature = 1.0
+    pValue = 0.9
+    seed = int(getTime().toUnix)
+    steps = 256
+    input = ""
+    tokenizer = "tokenizer.bin"
+    mode = "generate"
+    sysPrompt = "Only short answers"
+
+  for kind, key, val in getopt():
+    case kind
+    of cmdArgument:
+      discard  # ignore non-option arguments for now
+    of cmdLongOption, cmdShortOption:
+      case key
+      of "m", "model":
+        model = val
+      of "t", "temperature":
+        temperature = parseFloat(val)
+      of "p", "pvalue":
+        pValue = parseFloat(val)
+      of "s", "seed":
+        seed = parseInt(val)
+      of "n", "steps":
+        steps = parseInt(val)
+      of "i", "input":
+        input = val
+      of "k", "tokenizer":
+        tokenizer = val
+      of "o", "mode":
+        mode = val
+      of "y", "sysPrompt":
+        sysPrompt = val
+      else:
+        echo "Unknown option: ", key
+        quit(1)
+    of cmdEnd:
+      break
+
+  if model.len == 0:
+    quit("Model is required.")
+
+  main(model, temperature, pValue, seed, steps, input, tokenizer, mode, sysPrompt)
