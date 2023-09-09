@@ -1,0 +1,2 @@
+--d:danger
+--threads:on

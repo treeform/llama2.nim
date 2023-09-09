@@ -27,3 +27,5 @@ When she got there, she saw the dog. She was too shy to say anything
 
 achieved tok/s: 298.1149617785251
 ```
+
+If you want to use Llama2 weights you first need to download them and use the converter script. Then Please follow instructions https://github.com/karpathy/llama2.c repo. To download them you need to agree to Meta's license agreement. I am working on a pure Nim converter that can read pytrouch's pickle files and generate safe tensors.
