@@ -1,7 +1,8 @@
 import std/tables, std/times, math, std/algorithm, std/strutils,
     std/streams, std/memfiles, std/parseopt, std/rdstdin
 
-{.passC: "-Ofast -funsafe-math-optimizations -ffast-math -mtune=native -march=native".}
+# Add -march=native for extra speed.
+{.passC: "-Ofast -funsafe-math-optimizations -ffast-math -mtune=native".}
 
 type
   Config = object
@@ -574,12 +575,12 @@ proc generate*(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler,
 proc chat(transformer: Transformer, tokenizer: Tokenizer, sampler: Sampler, userPrompt: string, systemPrompt: string, steps: int) =
 
   var
-    promptTokens = newSeq[cint](1152)
-    userIdx: cint
+    promptTokens = newSeq[int32](1152)
+    userIdx: int32
 
   var
     userTurn: int8 = 1
-    next, token, prevToken, pos: cint
+    next, token, prevToken, pos: int32
 
   while pos < steps:
     if userTurn == 1:
