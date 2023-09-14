@@ -29,11 +29,8 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
     indent = ""
     marks: seq[int]
     numMemoize = 0
-
     stackGlobal: seq[(string, string)]
-
     memo: Table[int, JsonNode]
-
     stacks: seq[JsonNode]
     stack = newJArray()
 

@@ -12,3 +12,4 @@ nimcache
 .*
 __pycache__
 *.py
+output.m
