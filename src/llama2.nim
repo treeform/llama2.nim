@@ -1,11 +1,10 @@
 import std/tables, std/times, math, std/algorithm, std/strutils,
     std/streams, std/memfiles, std/parseopt, std/rdstdin
 
-# Add -march=native for extra speed.
-{.passC: "-Ofast -funsafe-math-optimizations -ffast-math -mtune=native".}
+{.passC: "-Ofast -funsafe-math-optimizations -ffast-math -mtune=native -march=native".}
 
 type
-  Config = object
+  Config* = object
     dim*: int32          # transformer dimension
     hiddenDim*: int32    # for ffn layers
     numLayers*: int32    # number of layers

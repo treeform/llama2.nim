@@ -29,7 +29,6 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
     indent = ""
     marks: seq[int]
     numMemoize = 0
-    stackGlobal: seq[(string, string)]
     memo: Table[int, JsonNode]
     stacks: seq[JsonNode]
     stack = newJArray()
@@ -44,29 +43,34 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
     let c = bin[i]
     let address = i
     case c
+
       of '\x80':
         inc i
         let v = bin.readUInt8(i)
         inc i
         display(&"PROTO      {v}")
+
       of 'K':
         inc i
         let v = bin.readUInt8(i)
         inc i
         display(&"BININT1    {v}")
         stack.add %v
+
       of 'M':
         inc i
         let v = bin.readInt16(i)
         i += 2
         display(&"BININT2    {v}")
         stack.add %v
+
       of 'J':
         inc i
         let v = bin.readInt32(i)
         i += 4
         display(&"BININT     {v}")
         stack.add %v
+
       of '\x8a':
         inc i
         let numLen = bin.readUInt8(i).int
@@ -78,15 +82,18 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
           stack.add %v
         else:
           quit("unsupported LONG1")
+
       of '\x95':
         inc i
         let v = bin.readUInt64(i)
         i += 8
         display(&"FRAME    {v}")
+
       of '.':
         inc i
         display(&"STOP")
         break
+
       of '\x8c':
         inc i
         let strLen = bin.readUInt8(i).int
@@ -95,6 +102,7 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
         i += strLen
         display(&"SHORT_BINUNICODE '{v}'")
         stack.add %v
+
       of 'X':
         inc i
         let strLen = bin.readUInt32(i).int
@@ -103,26 +111,32 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
         i += strLen
         display(&"BINUNICODE '{v}'")
         stack.add %v
+
       of '\x94':
         inc i
         display(&"MEMOIZE (as {numMemoize})")
         memo[numMemoize] = stack[^1]
         inc numMemoize
+
       of ']':
         inc i
         display(&"EMPTY_LIST")
         stack.add(newJArray())
+
       of ')':
         inc i
         display(&"EMPTY_TUPLE")
         stack.add(newJArray())
+
       of '}':
         inc i
         display(&"EMPTY_DICT")
         stack.add(newJObject())
+
       of '\x81':
         inc i
         display(&"NEWOBJ")
+
       of 'b':
         inc i
         display(&"BUILD")
@@ -134,6 +148,7 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
         v["args"] = args
         v["kargs"] = kargs
         stack.add(v)
+
       of '(':
         marks.add(i)
         inc i
@@ -141,6 +156,7 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
         indent.add("    ")
         stacks.add(stack)
         stack = newJArray()
+
       of 'e':
         inc i
         display(&"APPENDS (MARK at {marks[^1]})")
@@ -151,6 +167,7 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
         if stack.pop().kind != JArray:
           quit("JArray expected")
         stack.add(v)
+
       of 'u':
         inc i
         display(&"SETITEMS   (MARK at {marks[^1]})")
@@ -163,6 +180,7 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
         if stack.pop().kind != JObject:
           quit("JObject expected")
         stack.add(v)
+
       of 't':
         inc i
         display(&"TUPLE      (MARK at {marks[^1]})")
@@ -170,15 +188,15 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
         indent.setLen(indent.len - 4)
         var v = stack
         stack = stacks.pop()
-        # if stack.pop().kind != JArray:
-        #   quit("JArray expected")
         stack.add(v)
+
       of '\x85':
         inc i
         display(&"TUPLE1")
         var v = newJArray()
         v.add(stack.pop())
         stack.add(v)
+
       of '\x86':
         inc i
         display(&"TUPLE2")
@@ -186,21 +204,23 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
         v.add(stack.pop())
         v.add(stack.pop())
         stack.add(v)
+
       of 'G':
         inc i
         let v = bin.readFloat64(i).swap()
         i += 8
         display(&"BINFLOAT    {v}")
         stack.add %v
+
       of '\x93':
         inc i
         display(&"STACK_GLOBAL")
         let
           module = stack.pop().getStr
           name = stack.pop().getStr
-        #stackGlobal.add(())
         let v = module & "." & name
         stack.add %v
+
       of 'c':
         inc i
         var name = ""
@@ -216,12 +236,14 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
         display(&"GLOBAL     '{name} {module}'")
         let v = module & "." & name
         stack.add %v
+
       of 'q':
         inc i
         let slot = bin.readUInt8(i).int
         inc i
         display(&"BINPUT     {slot}")
         memo[slot.int] = stack[^1]
+
       of 'r':
         inc i
         let slot = bin.readUInt32(i).int
@@ -239,7 +261,6 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
       of 'Q':
         inc i
         display(&"BINPERSID")
-        ## ???  discard stack.pop()
 
       of '\x89':
         inc i
@@ -249,21 +270,19 @@ proc pickleToJsonSize*(bin: string, interactive = true): (JsonNode, int) =
       of 'R':
         inc i
         display(&"REDUCE")
-        #echo stack
         let args = stack.pop()
         let name = stack.pop()
         let v = newJObject()
         v["build"] = name
         v["args"] = args
         stack.add(v)
+
       else:
         quit("??: " & c.pr)
 
   if interactive:
     echo "highest protocol among opcodes = 2"
-    # echo stackGlobal
-    # echo stacks
-    # echo stack
+
   if stack.len != 1:
     quit("Items left on the stack")
   return (stack[0], i)

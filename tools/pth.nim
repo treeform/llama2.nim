@@ -1,6 +1,6 @@
 # PyTorch Model format reader.
 
-import std/json, zippy/ziparchives
+import std/json, zippy_extra, std/os, pickles, std/strutils
 
 type
   TensorStorage* = object
@@ -17,12 +17,18 @@ type
     stride*: seq[int]
     requiresGrad*: bool
 
-    memPointer*: pointer
-    storageSize*: int
+    data*: pointer
+    dataSize*: int
 
-  PyTorchFile* = ref object
+  TorchData* = ref object
     zips: seq[ZipArchiveReader]
     tensors*: seq[Tensor]
+
+proc `+`*(p: pointer, n: SomeInteger): pointer =
+  cast[pointer](cast[uint64](p) + n.uint64)
+
+proc `[]`*(p: pointer, n: SomeInteger): uint8 =
+  return cast[ptr[uint8]](p + n)[]
 
 proc toTensors*(data: JsonNode): seq[Tensor] =
 
@@ -31,7 +37,6 @@ proc toTensors*(data: JsonNode): seq[Tensor] =
     if value["build"].getStr == "_rebuild_tensor_v2.torch._utils":
       var tensor = Tensor()
       tensor.name = key
-      echo value["args"]
       tensor.storage.dataType = value["args"][0][1].getStr
       tensor.storage.fileName = value["args"][0][2].getStr
       tensor.storage.device = value["args"][0][3].getStr
@@ -44,10 +49,42 @@ proc toTensors*(data: JsonNode): seq[Tensor] =
       tensor.requires_grad = value["args"][5].getBool
 
       if tensor.size.len > 0:
-        tensor.storageSize = 1
+        tensor.dataSize = 1
         for s in tensor.size:
-          tensor.storageSize *= s
+          tensor.dataSize *= s
 
       result.add(tensor)
     else:
       quit("unknown object" & value["build"].getStr)
+
+proc loadTorchData*(path: string): TorchData =
+
+  result = TorchData()
+
+  for i in 0 ..< 100:
+    let pthPath = path & "/consolidated.0" & $i & ".pth"
+    if fileExists(pthPath):
+
+      let reader = openZipArchive(pthPath)
+      result.zips.add(reader)
+
+      doAssert reader.extractFile("consolidated/version").strip() == "3"
+
+      let
+        dataPickle = reader.extractFile("consolidated/data.pkl")
+        dataJson = dataPickle.pickleToJson(false)
+
+      let tensors = toTensors(dataJson)
+
+      for tensor in tensors:
+        tensor.data = reader.getPointer("consolidated/data/" & tensor.storage.fileName)
+        result.tensors.add(tensor)
+
+proc find*(torchData: TorchData, name: string): Tensor =
+  for tensor in torchData.tensors:
+    if tensor.name == name:
+      return tensor
+
+proc close*(torchData: TorchData) =
+  for zip in torchData.zips:
+    zip.close()
