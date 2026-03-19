@@ -138,6 +138,10 @@ proc newTransformer*(checkpointPath: string): Transformer =
     # The rest of the file
     t.weights.wcls = cast[ptr float32](filePosition)
 
+  # Make sure we did not read past the end of the file
+  #echo "filePosition: ", cast[int](filePosition) - cast[int](f.mem)
+  #echo "fileSize: ", t.fileSize
+
   # Allocate run state
   let kvDim = (c.dim * c.numKVHeads) div c.numHeads
   t.state.x = cast[ptr float32](alloc0(c.dim * sizeof(float32)))
@@ -365,7 +369,16 @@ proc forward(transformer: Transformer, token: int32, pos: int32): ptr float32 =
     # Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
     # First calculate self.w1(x) and self.w3(x)
     matMul(s.hb, s.xb, w.w1 + l * dim * hiddenDim, dim, hiddenDim)
+    #echo "{"
+    #echo "s.hb2: ", cast[int](s.hb2)
+    #echo "s.xb: ", cast[int](s.xb)
+    #echo "l: ", l
+    #echo "dim: ", dim
+    #echo "hiddenDim: ", hiddenDim
+    #echo "w.w3: ", cast[int](w.w3)
+    #echo "l * dim * hiddenDim: ", l * dim * hiddenDim
     matMul(s.hb2, s.xb, w.w3 + l * dim * hiddenDim, dim, hiddenDim)
+    #echo "}"
 
     # SwiGLU non-linearity
     for i in 0..<hiddenDim:

@@ -57,28 +57,42 @@ proc toTensors*(data: JsonNode): seq[Tensor] =
     else:
       quit("unknown object" & value["build"].getStr)
 
-proc loadTorchData*(path: string): TorchData =
+proc loadTorchArchive(torchData: TorchData, pthPath: string) =
+  ## Loads one zip-style PyTorch archive into one `TorchData`.
+  let reader = openZipArchive(pthPath)
+  torchData.zips.add(reader)
 
+  doAssert reader.extractFile("consolidated/version").strip() == "3"
+
+  let
+    dataPickle = reader.extractFile("consolidated/data.pkl")
+    dataJson = dataPickle.pickleToJson(false)
+    tensors = toTensors(dataJson)
+
+  for tensor in tensors:
+    tensor.data = reader.getPointer("consolidated/data/" & tensor.storage.fileName)
+    torchData.tensors.add(tensor)
+
+proc loadTorchData*(path: string): TorchData =
+  ## Loads torch tensors from either one shard directory or one `.pth` file.
   result = TorchData()
 
+  if fileExists(path):
+    if path.toLowerAscii().endsWith(".pth"):
+      result.loadTorchArchive(path)
+      return
+    raise newException(
+      CatchableError,
+      "Expected a .pth file or directory, got file: " & path
+    )
+
+  if not dirExists(path):
+    raise newException(CatchableError, "Torch path does not exist: " & path)
+
   for i in 0 ..< 100:
-    let pthPath = path & "/consolidated.0" & $i & ".pth"
+    let pthPath = path / ("consolidated.0" & $i & ".pth")
     if fileExists(pthPath):
-
-      let reader = openZipArchive(pthPath)
-      result.zips.add(reader)
-
-      doAssert reader.extractFile("consolidated/version").strip() == "3"
-
-      let
-        dataPickle = reader.extractFile("consolidated/data.pkl")
-        dataJson = dataPickle.pickleToJson(false)
-
-      let tensors = toTensors(dataJson)
-
-      for tensor in tensors:
-        tensor.data = reader.getPointer("consolidated/data/" & tensor.storage.fileName)
-        result.tensors.add(tensor)
+      result.loadTorchArchive(pthPath)
 
 proc find*(torchData: TorchData, name: string): Tensor =
   for tensor in torchData.tensors:
